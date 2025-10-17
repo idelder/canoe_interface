@@ -395,9 +395,9 @@ def build_desired_ids_from_matrix(
 
     if selected_regions:
         for r in selected_regions:
-            desired |= csv_match_prefix_region(csv_ids, "DISTHR", r)
-    if "DISTHR001" in csv_ids:
-        desired.add("DISTHR001")
+            desired |= csv_match_prefix_region(csv_ids, "FUELHR", r)
+    if "FUELHR001" in csv_ids:
+        desired.add("FUELHR001")
 
     # Generic sector HR IDs (only when that sector appears anywhere in the matrix)
     def _maybe_add_generic(sec_key: str) -> None:
