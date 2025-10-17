@@ -164,7 +164,8 @@ def filter_func(output_db: str) -> None:
                     for tech in tech_gone:
                         curs.execute(f'DELETE FROM {table} WHERE tech == ?', (tech,))
 
-            finished = len(bad_rt) > 0
+            logger.debug("Pruned %d orphan region-tech pairs, %d orphan techs", len(bad_rt), len(tech_gone))
+            finished = len(bad_rt) == 0
 
         # Timing-based pruning
         finished = False
@@ -182,25 +183,24 @@ def filter_func(output_db: str) -> None:
             for r, t, v, lp in curs.execute('SELECT region, tech, vintage, lifetime FROM LifetimeProcess').fetchall():
                 lifetime_process[(r, t, v)] = lp
 
+            # Get the efficiency table
             df_eff = pd.read_sql_query('SELECT * FROM Efficiency', conn)
-            df_eff['last_out'] = df_eff.apply(lambda row: row['vintage'] + int(lifetime_process[(row['region'], row['tech'], row['vintage'])]), axis=1)
-            df_eff['last_out'] = df_eff['last_out'].apply(lambda p: min(2050, 5 * ((p - 1) // 5)))
 
+            # Last period each process is producing its output commodity
+            df_eff['last_out'] = df_eff['vintage'] + [int(lifetime_process[tuple(rtv)]) for rtv in df_eff[['region','tech','vintage']].values]
+            df_eff['last_out'] = [min(2050,5*((p-1) // 5)) for p in df_eff['last_out']]
+
+            # Last period each commodity is consumed in each region
+            df_last_in = df_eff.groupby(['region','input_comm'])['last_out'].max()
             demand_comms = [c[0] for c in curs.execute("SELECT name FROM Commodity WHERE flag == 'd'").fetchall()]
-            df_eff_nondem = df_eff.loc[~df_eff['output_comm'].isin(demand_comms)].copy()
+            df_eff = df_eff.loc[~df_eff['output_comm'].isin(demand_comms)]
+            df_eff['last_in'] = [df_last_in.loc[tuple(ro)] for ro in df_eff[['region','output_comm']].values]
 
-            df_last_in = (
-                df_eff_nondem.groupby(['region', 'input_comm'])['last_out'].max().rename('last_in')
-            )
-            df_eff_nondem = df_eff_nondem.join(
-                df_last_in, on=['region', 'output_comm'], how='left'
-            )
-            df_remove = df_eff_nondem.loc[df_eff_nondem['last_in'] < df_eff_nondem['last_out']]
+            # Remove any processes that are producing their output comm after anything is consuming it
+            df_remove = df_eff.loc[df_eff['last_in'] < df_eff['last_out']]
+            bad_ritvo = df_remove[['region','input_comm','tech','vintage','output_comm']].values
 
-            for _, row in df_remove.iterrows():
-                region, input_comm, tech, vintage, output_comm = (
-                    row['region'], row['input_comm'], row['tech'], row['vintage'], row['output_comm']
-                )
+            for region, input_comm, tech, vintage, output_comm in bad_ritvo:
                 curs.execute(
                     """
                     DELETE FROM Efficiency 
@@ -214,7 +214,8 @@ def filter_func(output_db: str) -> None:
                         (region, tech, vintage),
                     )
 
-            finished = len(df_remove) > 0
+            logger.debug("Pruned %d timing-infeasible Efficiency rows", len(df_remove))
+            finished = len(df_remove) == 0
 
         conn.commit()
         conn.close()
