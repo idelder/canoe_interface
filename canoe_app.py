@@ -19,7 +19,7 @@ import pandas as pd
 # Paths & Constants
 # ------------------------------
 SQLITE_FOLDER = "input"
-MASTER_DB = "master.sqlite"
+# MASTER_DB = "master.sqlite"
 DATASETS_CSV = "input/datasets.csv"
 SCHEMA_FILE = "input/schema.sql"
 
@@ -562,6 +562,7 @@ def aggregate_sqlite_files(
     global_settings: Dict[str, bool],
     get_current_regions,
     output_filename: str,
+    input_filename: str,
 ) -> None:
     desired_ids = build_desired_ids_from_matrix(matrix, csv_ids, global_settings, get_current_regions)
     if not desired_ids:
@@ -572,8 +573,8 @@ def aggregate_sqlite_files(
     id_str = "('" + "', '".join(selected_data_ids) + "')"
     #print(f"[DEBUG] IN-clause: {id_str}")
 
-    master_db_path = os.path.join(SQLITE_FOLDER, MASTER_DB)
-    output_db = f"{output_filename}.sqlite"
+    master_db_path = input_filename
+    output_db = output_filename
 
     if os.path.exists(output_db):
         os.remove(output_db)
@@ -670,7 +671,8 @@ def main(page: ft.Page) -> None:
 
     # Widgets
     status_text = ft.Text("")
-    filename_text_field = ft.TextField(label="Output Filename (no file extension)", value="", width=260)
+    in_filename_text_field = ft.TextField(label="Input file path (e.g. dataset.sqlite)", value="", width=260)
+    out_filename_text_field = ft.TextField(label="Output file path (e.g. canoe.sqlite)", value="", width=260)
     power_system_checkbox = ft.Checkbox(label="Power system model", value=False)
     image = ft.Container(content=ft.Image(src="./assets/logo.png", height=50, width=60), alignment=ft.alignment.top_right)
 
@@ -783,7 +785,13 @@ def main(page: ft.Page) -> None:
         status_text.value = "Processing..."
         page.update()
 
-        output_filename = filename_text_field.value.strip()
+        input_filename = in_filename_text_field.value.strip()
+        if not input_filename:
+            status_text.value = "Error: Filename cannot be empty."
+            page.update()
+            return
+
+        output_filename = out_filename_text_field.value.strip()
         if not output_filename:
             status_text.value = "Error: Filename cannot be empty."
             page.update()
@@ -801,6 +809,7 @@ def main(page: ft.Page) -> None:
                 csv_ids=csv_ids,
                 global_settings=global_settings,
                 get_current_regions=get_current_regions,
+                input_filename=input_filename,
                 output_filename=output_filename,
             )
             status_text.value = f"Aggregation complete. Output: {output_filename}.sqlite"
@@ -875,7 +884,7 @@ def main(page: ft.Page) -> None:
             ),
             ft.Divider(),
             ft.Row(
-                [filename_text_field, submit_button, status_text],
+                [in_filename_text_field, out_filename_text_field, submit_button, status_text],
                 alignment=ft.MainAxisAlignment.CENTER,
                 spacing=30,
             ),
