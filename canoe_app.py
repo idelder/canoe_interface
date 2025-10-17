@@ -92,32 +92,9 @@ def filter_func(output_db: str) -> None:
     conn = sqlite3.connect(output_db)
     curs = conn.cursor()
 
-    # Normalize diesel naming if present
-    try:
-        curs.execute('DELETE FROM Commodity WHERE name == "E_dies"')
-        curs.execute('UPDATE Efficiency SET input_comm == "E_dsl" WHERE input_comm == "E_dies"')
-    except sqlite3.Error:
-        #print("[INFO] No E_dies found in dataset; skipping rename.")
-        return
-    # Remove redundant costs where period > vintage for fuel technologies
-    try:
-        curs.execute(
-            """
-            DELETE FROM CostVariable 
-            WHERE tech LIKE 'F_%' AND period > vintage
-            """
-        )
-        curs.execute(
-            """
-            DELETE FROM CostFixed
-            WHERE tech LIKE 'F_%' AND period > vintage
-            """
-        )
-    except sqlite3.Error as e:
-        #print(f"[WARN] Skipping redundant cost removal: {e}")
-        return
     # Iteratively prune orphan processes/techs
-    for _ in range(5):
+    finished = False
+    while not finished:
         regions = [r[0] for r in curs.execute('SELECT region FROM Region').fetchall()]
         _ = regions  # reserved for future use
 
@@ -151,8 +128,11 @@ def filter_func(output_db: str) -> None:
                 for tech in tech_gone:
                     curs.execute(f'DELETE FROM {table} WHERE tech == ?', (tech,))
 
+        finished = len(bad_rt) > 0
+
     # Timing-based pruning
-    for _ in range(5):
+    finished = False
+    while not finished:
         # Time horizon (exclude final marker period)
         time_all = [p[0] for p in curs.execute('SELECT period FROM TimePeriod').fetchall()][:-1]
 
@@ -163,8 +143,8 @@ def filter_func(output_db: str) -> None:
         for r, t, lt in curs.execute('SELECT region, tech, lifetime FROM LifetimeTech').fetchall():
             for v in time_all:
                 lifetime_process[(r, t, v)] = lt
-        for r, t, v, lt in curs.execute('SELECT region, tech, vintage, lifetime FROM LifetimeProcess').fetchall():
-            lifetime_process[(r, t, v)] = lt
+        for r, t, v, lp in curs.execute('SELECT region, tech, vintage, lifetime FROM LifetimeProcess').fetchall():
+            lifetime_process[(r, t, v)] = lp
 
         df_eff = pd.read_sql_query('SELECT * FROM Efficiency', conn)
         df_eff['last_out'] = df_eff.apply(lambda row: row['vintage'] + int(lifetime_process[(row['region'], row['tech'], row['vintage'])]), axis=1)
@@ -197,6 +177,8 @@ def filter_func(output_db: str) -> None:
                     f"DELETE FROM {tbl} WHERE region = ? AND tech = ? AND vintage = ?",
                     (region, tech, vintage),
                 )
+
+        finished = len(df_remove) > 0
 
     conn.commit()
     conn.close()
