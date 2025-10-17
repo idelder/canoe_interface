@@ -11,6 +11,9 @@ import json
 import os
 import re
 import sqlite3
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
 from typing import Dict, Iterable, List, Set, Tuple
 
 import flet as ft
@@ -25,6 +28,35 @@ DATASETS_CSV = "input/datasets.csv"
 SCHEMA_FILE = "input/schema.sql"
 CONFIG_FILE = "input/canoe_config.json"
 
+# New logging config
+LOG_DIR = "logs"
+LOG_FILE = os.path.join(LOG_DIR, "canoe_app.log")
+
+def setup_logging() -> logging.Logger:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    logger = logging.getLogger("canoe_app")
+    logger.setLevel(logging.DEBUG)
+
+    # Rotating file handler
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh_formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(module)s:%(lineno)d - %(message)s")
+    fh.setFormatter(fh_formatter)
+    logger.addHandler(fh)
+
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch_formatter = logging.Formatter("%(asctime)s %(levelname)s - %(message)s", "%H:%M:%S")
+    ch.setFormatter(ch_formatter)
+    logger.addHandler(ch)
+
+    # Avoid duplicate logs if re-imported
+    logger.propagate = False
+    return logger
+
+logger = setup_logging()
+logger.debug("Logging initialized")
 
 ALL_REGIONS = [
     "AB", "BC", "MB", "ON", "QC", "SK", "NB", "NS", "PEI", "NLLAB"
@@ -92,99 +124,104 @@ CONFLICT_SUFFIXES = {
 
 def filter_func(output_db: str) -> None:
     """Run cleanup transformations on the aggregated SQLite file."""
-    conn = sqlite3.connect(output_db)
-    curs = conn.cursor()
+    try:
+        conn = sqlite3.connect(output_db)
+        curs = conn.cursor()
 
-    # Iteratively prune orphan processes/techs
-    finished = False
-    while not finished:
-        regions = [r[0] for r in curs.execute('SELECT region FROM Region').fetchall()]
-        _ = regions  # reserved for future use
+        # Iteratively prune orphan processes/techs
+        finished = False
+        while not finished:
+            regions = [r[0] for r in curs.execute('SELECT region FROM Region').fetchall()]
+            _ = regions  # reserved for future use
 
-        # techs that output a non-demand commodity that isn't consumed anywhere
-        bad_rt = curs.execute(
-            """
-            SELECT region, tech 
-            FROM Efficiency 
-            WHERE output_comm NOT IN (SELECT name FROM Commodity WHERE flag == 'd')
-              AND (region, output_comm) NOT IN (
-                    SELECT region, input_comm FROM Efficiency
-              )
-            """
-        ).fetchall()
-
-        tables = [t[0] for t in curs.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]
-
-        for table in tables:
-            cols = [c[1] for c in curs.execute(f'PRAGMA table_info({table});')]
-            if 'region' in cols and 'tech' in cols:
-                for rt in bad_rt:
-                    curs.execute(f"DELETE FROM {table} WHERE region == ? AND tech == ?", (rt[0], rt[1]))
-
-        tech_remaining = {t[0] for t in curs.execute('SELECT DISTINCT tech FROM Efficiency').fetchall()}
-        tech_before = {t[0] for t in curs.execute('SELECT DISTINCT tech FROM Technology').fetchall()}
-        tech_gone = tech_before - tech_remaining
-
-        for table in tables:
-            cols = [c[1] for c in curs.execute(f'PRAGMA table_info({table});')]
-            if 'tech' in cols:
-                for tech in tech_gone:
-                    curs.execute(f'DELETE FROM {table} WHERE tech == ?', (tech,))
-
-        finished = len(bad_rt) > 0
-
-    # Timing-based pruning
-    finished = False
-    while not finished:
-        # Time horizon (exclude final marker period)
-        time_all = [p[0] for p in curs.execute('SELECT period FROM TimePeriod').fetchall()][:-1]
-
-        # Build lifetimes map with sensible defaults
-        lifetime_process = {}
-        for r, t, v in curs.execute('SELECT region, tech, vintage FROM Efficiency').fetchall():
-            lifetime_process[(r, t, v)] = 40
-        for r, t, lt in curs.execute('SELECT region, tech, lifetime FROM LifetimeTech').fetchall():
-            for v in time_all:
-                lifetime_process[(r, t, v)] = lt
-        for r, t, v, lp in curs.execute('SELECT region, tech, vintage, lifetime FROM LifetimeProcess').fetchall():
-            lifetime_process[(r, t, v)] = lp
-
-        df_eff = pd.read_sql_query('SELECT * FROM Efficiency', conn)
-        df_eff['last_out'] = df_eff.apply(lambda row: row['vintage'] + int(lifetime_process[(row['region'], row['tech'], row['vintage'])]), axis=1)
-        df_eff['last_out'] = df_eff['last_out'].apply(lambda p: min(2050, 5 * ((p - 1) // 5)))
-
-        demand_comms = [c[0] for c in curs.execute("SELECT name FROM Commodity WHERE flag == 'd'").fetchall()]
-        df_eff_nondem = df_eff.loc[~df_eff['output_comm'].isin(demand_comms)].copy()
-
-        df_last_in = (
-            df_eff_nondem.groupby(['region', 'input_comm'])['last_out'].max().rename('last_in')
-        )
-        df_eff_nondem = df_eff_nondem.join(
-            df_last_in, on=['region', 'output_comm'], how='left'
-        )
-        df_remove = df_eff_nondem.loc[df_eff_nondem['last_in'] < df_eff_nondem['last_out']]
-
-        for _, row in df_remove.iterrows():
-            region, input_comm, tech, vintage, output_comm = (
-                row['region'], row['input_comm'], row['tech'], row['vintage'], row['output_comm']
-            )
-            curs.execute(
+            # techs that output a non-demand commodity that isn't consumed anywhere
+            bad_rt = curs.execute(
                 """
-                DELETE FROM Efficiency 
-                WHERE region = ? AND input_comm = ? AND tech = ? AND vintage = ? AND output_comm = ?
-                """,
-                (region, input_comm, tech, vintage, output_comm),
+                SELECT region, tech 
+                FROM Efficiency 
+                WHERE output_comm NOT IN (SELECT name FROM Commodity WHERE flag == 'd')
+                  AND (region, output_comm) NOT IN (
+                        SELECT region, input_comm FROM Efficiency
+                  )
+                """
+            ).fetchall()
+
+            tables = [t[0] for t in curs.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]
+
+            for table in tables:
+                cols = [c[1] for c in curs.execute(f'PRAGMA table_info({table});')]
+                if 'region' in cols and 'tech' in cols:
+                    for rt in bad_rt:
+                        curs.execute(f"DELETE FROM {table} WHERE region == ? AND tech == ?", (rt[0], rt[1]))
+
+            tech_remaining = {t[0] for t in curs.execute('SELECT DISTINCT tech FROM Efficiency').fetchall()}
+            tech_before = {t[0] for t in curs.execute('SELECT DISTINCT tech FROM Technology').fetchall()}
+            tech_gone = tech_before - tech_remaining
+
+            for table in tables:
+                cols = [c[1] for c in curs.execute(f'PRAGMA table_info({table});')]
+                if 'tech' in cols:
+                    for tech in tech_gone:
+                        curs.execute(f'DELETE FROM {table} WHERE tech == ?', (tech,))
+
+            finished = len(bad_rt) > 0
+
+        # Timing-based pruning
+        finished = False
+        while not finished:
+            # Time horizon (exclude final marker period)
+            time_all = [p[0] for p in curs.execute('SELECT period FROM TimePeriod').fetchall()][:-1]
+
+            # Build lifetimes map with sensible defaults
+            lifetime_process = {}
+            for r, t, v in curs.execute('SELECT region, tech, vintage FROM Efficiency').fetchall():
+                lifetime_process[(r, t, v)] = 40
+            for r, t, lt in curs.execute('SELECT region, tech, lifetime FROM LifetimeTech').fetchall():
+                for v in time_all:
+                    lifetime_process[(r, t, v)] = lt
+            for r, t, v, lp in curs.execute('SELECT region, tech, vintage, lifetime FROM LifetimeProcess').fetchall():
+                lifetime_process[(r, t, v)] = lp
+
+            df_eff = pd.read_sql_query('SELECT * FROM Efficiency', conn)
+            df_eff['last_out'] = df_eff.apply(lambda row: row['vintage'] + int(lifetime_process[(row['region'], row['tech'], row['vintage'])]), axis=1)
+            df_eff['last_out'] = df_eff['last_out'].apply(lambda p: min(2050, 5 * ((p - 1) // 5)))
+
+            demand_comms = [c[0] for c in curs.execute("SELECT name FROM Commodity WHERE flag == 'd'").fetchall()]
+            df_eff_nondem = df_eff.loc[~df_eff['output_comm'].isin(demand_comms)].copy()
+
+            df_last_in = (
+                df_eff_nondem.groupby(['region', 'input_comm'])['last_out'].max().rename('last_in')
             )
-            for tbl in ("CostVariable", "CostFixed", "EmissionActivity"):
-                curs.execute(
-                    f"DELETE FROM {tbl} WHERE region = ? AND tech = ? AND vintage = ?",
-                    (region, tech, vintage),
+            df_eff_nondem = df_eff_nondem.join(
+                df_last_in, on=['region', 'output_comm'], how='left'
+            )
+            df_remove = df_eff_nondem.loc[df_eff_nondem['last_in'] < df_eff_nondem['last_out']]
+
+            for _, row in df_remove.iterrows():
+                region, input_comm, tech, vintage, output_comm = (
+                    row['region'], row['input_comm'], row['tech'], row['vintage'], row['output_comm']
                 )
+                curs.execute(
+                    """
+                    DELETE FROM Efficiency 
+                    WHERE region = ? AND input_comm = ? AND tech = ? AND vintage = ? AND output_comm = ?
+                    """,
+                    (region, input_comm, tech, vintage, output_comm),
+                )
+                for tbl in ("CostVariable", "CostFixed", "EmissionActivity"):
+                    curs.execute(
+                        f"DELETE FROM {tbl} WHERE region = ? AND tech = ? AND vintage = ?",
+                        (region, tech, vintage),
+                    )
 
-        finished = len(df_remove) > 0
+            finished = len(df_remove) > 0
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
+        logger.debug("filter_func completed for %s", output_db)
+    except Exception as e:
+        logger.exception("filter_func failed for %s: %s", output_db, e)
+        # don't re-raise here; best-effort cleanup
 
 
 # ------------------------------
@@ -245,7 +282,7 @@ def csv_match_intertie(csv_ids: Iterable[str], prefix: str, r1: str, r2: str) ->
 
 def get_data_ids_from_csv(file_path: str) -> List[str]:
     if not os.path.exists(file_path):
-        #print(f"[WARN] datasets.csv not found at {file_path}")
+        logger.warning("datasets.csv not found at %s", file_path)
         return []
     # Try pandas first
     try:
@@ -255,23 +292,26 @@ def get_data_ids_from_csv(file_path: str) -> List[str]:
         if df.shape[1] == 1:
             col = df.columns[0]
             return [str(x).strip() for x in df[col].dropna().astype(str)]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.exception("Failed to read datasets CSV with pandas: %s", e)
     # Fallback CSV reader
     out: List[str] = []
-    with open(file_path, 'r', newline='') as f:
-        reader = csv.reader(f)
-        first = True
-        for row in reader:
-            if not row:
-                continue
-            val = row[0].strip()
-            if first and val.lower() in ("data_id", "id"):
+    try:
+        with open(file_path, 'r', newline='') as f:
+            reader = csv.reader(f)
+            first = True
+            for row in reader:
+                if not row:
+                    continue
+                val = row[0].strip()
+                if first and val.lower() in ("data_id", "id"):
+                    first = False
+                    continue
                 first = False
-                continue
-            first = False
-            if val:
-                out.append(val)
+                if val:
+                    out.append(val)
+    except Exception as e:
+        logger.exception("Fallback CSV reader failed for %s: %s", file_path, e)
     return out
 
 # New: lightweight config loader (returns dict)
@@ -279,9 +319,11 @@ def load_config() -> dict:
     try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
-                return json.load(fh)
-    except Exception:
-        pass
+                cfg = json.load(fh)
+                logger.debug("Loaded config from %s", CONFIG_FILE)
+                return cfg
+    except Exception as e:
+        logger.exception("Failed to load config %s: %s", CONFIG_FILE, e)
     return {}
 
 # ------------------------------
@@ -493,7 +535,7 @@ def get_demand_lists_region_aware(
             commodities.discard('R_ethos')
 
     except sqlite3.Error as e:
-        #print(f"[ERROR] DB traversal failed: {e}")
+        logger.exception("DB traversal failed for %s (power_system_model=%s): %s", output_db, power_system_model, e)
         return [], []
 
     com_list = sorted(commodities)
@@ -527,7 +569,7 @@ def table_has_region_column(cursor: sqlite3.Cursor, table: str) -> bool:
 
 def delete_rows_not_in_regions(conn: sqlite3.Connection, tables: List[str], allowed_regions: List[str]) -> None:
     if not allowed_regions:
-        #print("[WARN] No regions selected; skipping region filtering to avoid empty DB.")
+        logger.warning("No allowed regions specified; skipping region pruning.")
         return
 
     cur = conn.cursor()
@@ -538,9 +580,9 @@ def delete_rows_not_in_regions(conn: sqlite3.Connection, tables: List[str], allo
         try:
             if table_has_region_column(cur, table):
                 cur.execute(f"DELETE FROM {table} WHERE region NOT IN ({placeholders});", allowed_regions)
-                #print(f"[DEBUG] Region-pruned table: {table} (kept regions: {allowed_regions})")
+                logger.debug("Region-pruned table: %s (kept: %s)", table, allowed_regions)
         except sqlite3.Error as e:
-            #print(f"[WARN] Skipped region filter for {table}: {e}")
+            logger.exception("Skipped region filter for %s: %s", table, e)
             return
     conn.commit()
     cur.execute("PRAGMA foreign_keys = ON;")
@@ -558,87 +600,97 @@ def aggregate_sqlite_files(
     output_filename: str,
     input_filename: str,
 ) -> None:
-    desired_ids = build_desired_ids_from_matrix(matrix, csv_ids, global_settings, get_current_regions)
-    if not desired_ids:
-        #print("No matching IDs.")
-        return
+    try:
+        desired_ids = build_desired_ids_from_matrix(matrix, csv_ids, global_settings, get_current_regions)
+        if not desired_ids:
+            logger.info("No matching IDs found; skipping aggregation")
+            return
 
-    selected_data_ids = sorted(desired_ids)
-    id_str = "('" + "', '".join(selected_data_ids) + "')"
-    #print(f"[DEBUG] IN-clause: {id_str}")
+        selected_data_ids = sorted(desired_ids)
+        id_str = "('" + "', '".join(selected_data_ids) + "')"
+        logger.debug("Selected IDs count: %d", len(selected_data_ids))
 
-    master_db_path = input_filename
-    output_db = output_filename
+        master_db_path = input_filename
+        output_db = output_filename
 
-    if os.path.exists(output_db):
-        os.remove(output_db)
+        if os.path.exists(output_db):
+            os.remove(output_db)
+            logger.debug("Removed existing output DB: %s", output_db)
 
-    # Create output schema
-    output_conn = sqlite3.connect(output_db)
-    output_cursor = output_conn.cursor()
-    with open(SCHEMA_FILE, 'r') as file:
-        schema = file.read()
-    output_cursor.executescript(schema)
-    output_conn.commit()
-
-    # Read from master
-    master_conn = sqlite3.connect(master_db_path)
-    master_cursor = master_conn.cursor()
-
-    master_cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-    tables = [row[0] for row in master_cursor.fetchall()]
-
-    # Full-copy tables (no data_id filtering)
-    full_copy_tables = [
-        'CommodityType', 'MetaData', 'MetaDataReal', 'TechnologyType',
-        'DataQualityCredibility', 'DataQualityGeography', 'Operator', 'Region',
-        'DataQualityStructure', 'SeasonLabel', 'SectorLabel', 'DataQualityTechnology',
-        'DataQualityTime', 'TimeOfDay', 'TimePeriod', 'TimePeriodType', 'TimeSeason',
-        'TimeSeasonSequential', 'TimeSegmentFraction'
-    ]
-
-    output_cursor.execute('PRAGMA foreign_keys = OFF;')
-    for table in tables:
-        if table in full_copy_tables:
-            master_cursor.execute(f"SELECT * FROM {table};")
-        else:
-            master_cursor.execute(f"SELECT * FROM {table} WHERE data_id IN {id_str};")
-        data = master_cursor.fetchall()
-        if data:
-            columns = [col[0] for col in master_cursor.description]
-            placeholders = ', '.join(['?'] * len(columns))
-            output_cursor.executemany(f"INSERT OR IGNORE INTO {table} VALUES ({placeholders});", data)
-           # print(f"[DEBUG] Copied table: {table}{' (full copy)' if table in full_copy_tables else ' (filtered)'}")
+        # Create output schema
+        output_conn = sqlite3.connect(output_db)
+        output_cursor = output_conn.cursor()
+        with open(SCHEMA_FILE, 'r') as file:
+            schema = file.read()
+        output_cursor.executescript(schema)
         output_conn.commit()
 
-    # Demand-led pruning
-    com_list, tech_list = get_demand_lists_region_aware(
-        output_db, output_conn, power_system_model=global_settings.get("power_system_model", False)
-    )
-    if tech_list:
-        tech_str = "('" + "', '".join(tech_list) + "')"
-        output_cursor.execute(f'DELETE FROM Efficiency WHERE tech NOT IN {tech_str}')
-        output_cursor.execute(f'DELETE FROM Technology WHERE tech NOT IN {tech_str}')
-        output_cursor.execute(f'DELETE FROM LifetimeTech WHERE tech NOT IN {tech_str}')
-        output_cursor.execute(f'DELETE FROM CostVariable WHERE tech NOT IN {tech_str}')
-        output_cursor.execute(f'DELETE FROM EmissionActivity WHERE tech NOT IN {tech_str}')
-    if com_list:
-        com_str = "('" + "', '".join(com_list) + "')"
-        output_cursor.execute(f'DELETE FROM Commodity WHERE name NOT IN {com_str}')
+        # Read from master
+        master_conn = sqlite3.connect(master_db_path)
+        master_cursor = master_conn.cursor()
 
-    output_conn.commit()
+        master_cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = {t[0] for t in master_cursor.fetchall()}
 
-    # Region pruning
-    selected_regions = sorted(infer_selected_regions_from_matrix(matrix))
-    #print(f"[DEBUG] Selected regions for pruning: {selected_regions if selected_regions else '(none)'}")
-    delete_rows_not_in_regions(output_conn, tables, selected_regions)
+        # Basic index tables that should be filled in schema or are dataset-only
+        tables -= {
+            'CommodityType', 'Operator', 'TechnologyType', 'TimePeriodType',
+            'DataQualityCredibility', 'DataQualityDataQualityGeography',
+            'DataQualityStructure', 'DataQualityTechnology', 'DataQualityTime',
+            'TechnologyLabel', 'CommodityLabel', 'DataSourceLabel'
+        }
+            
+        output_cursor.execute('PRAGMA foreign_keys = OFF;')
+        for table in tables:
+            try:
+                cols = [c[1] for c in master_cursor.execute(f'PRAGMA table_info({table});')]
+                if 'data_id' in cols:
+                    master_cursor.execute(f"SELECT * FROM {table} WHERE data_id IN {id_str};")
+                else:
+                    master_cursor.execute(f"SELECT * FROM {table};")
+                data = master_cursor.fetchall()
+                if data:
+                    columns = [col[0] for col in master_cursor.description]
+                    placeholders = ', '.join(['?'] * len(columns))
+                    output_cursor.executemany(f"INSERT OR IGNORE INTO {table} VALUES ({placeholders});", data)
+                    logger.debug("Copied table: %s (%s rows)", table, len(data))
+                output_conn.commit()
+            except sqlite3.Error as e:
+                logger.exception("SQLite error copying table %s: %s", table, e)
+                # continue to next table to attempt best-effort aggregation
+                continue
 
-    master_conn.close()
-    output_conn.close()
+        # Demand-led pruning
+        com_list, tech_list = get_demand_lists_region_aware(
+            output_db, output_conn, power_system_model=global_settings.get("power_system_model", False)
+        )
+        if tech_list:
+            tech_str = "('" + "', '".join(tech_list) + "')"
+            output_cursor.execute(f'DELETE FROM Efficiency WHERE tech NOT IN {tech_str}')
+            output_cursor.execute(f'DELETE FROM Technology WHERE tech NOT IN {tech_str}')
+            output_cursor.execute(f'DELETE FROM LifetimeTech WHERE tech NOT IN {tech_str}')
+            output_cursor.execute(f'DELETE FROM CostVariable WHERE tech NOT IN {tech_str}')
+            output_cursor.execute(f'DELETE FROM EmissionActivity WHERE tech NOT IN {tech_str}')
+        if com_list:
+            com_str = "('" + "', '".join(com_list) + "')"
+            output_cursor.execute(f'DELETE FROM Commodity WHERE name NOT IN {com_str}')
 
-    # Final post-aggregation cleanup
-    filter_func(output_db)
-    #print(f"[DEBUG] Aggregation complete. Output: {output_db}")
+        output_conn.commit()
+
+        # Region pruning
+        selected_regions = sorted(infer_selected_regions_from_matrix(matrix))
+        logger.debug("Selected regions for pruning: %s", selected_regions if selected_regions else "(none)")
+        delete_rows_not_in_regions(output_conn, tables, selected_regions)
+
+        master_conn.close()
+        output_conn.close()
+
+        # Final post-aggregation cleanup
+        filter_func(output_db)
+        logger.info("Aggregation complete. Output: %s", output_db)
+    except Exception as e:
+        logger.exception("Unhandled error during aggregation (input=%s output=%s): %s", input_filename, output_filename, e)
+        raise
 
 
 # ------------------------------
@@ -686,8 +738,9 @@ def main(page: ft.Page) -> None:
             os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
             with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
                 json.dump(cfg, fh, indent=2, ensure_ascii=False)
-        except Exception:
-            # silently ignore save failures to avoid interrupting UI
+            logger.debug("Saved config to %s", CONFIG_FILE)
+        except Exception as e:
+            logger.exception("Failed to save config %s: %s", CONFIG_FILE, e)
             pass
 
     def get_current_regions() -> List[str]:
@@ -730,7 +783,11 @@ def main(page: ft.Page) -> None:
     def update_ui_matrix() -> None:
         """Rebuild the matrix rows whenever regions set changes."""
         # clear matrix grid container (index 4 -> matrix area)
-        main_content.controls[4].controls[0].controls.clear()
+        try:
+            main_content.controls[4].controls[0].controls.clear()
+        except Exception as e:
+            logger.exception("Failed to clear UI matrix container: %s", e)
+            return
 
         current_regions = get_current_regions()
 
@@ -765,21 +822,24 @@ def main(page: ft.Page) -> None:
                         val = saved_cfg["matrix"].get(key)
                         if val is not None:
                             dd.value = val
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.exception("Failed applying saved value for %s|%s: %s", region, sector, e)
                 # If power-system model is active, non-Elc sectors must be disabled/NA
                 try:
                     if global_settings.get("power_system_model", False) and sector != "Elc":
                         dd.value = "NA"
                         dd.disabled = True
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.exception("Failed enforcing power-system rule for %s|%s: %s", region, sector, e)
 
             matrix_rows.append(ft.Row(row_elements, alignment=ft.MainAxisAlignment.START))
 
         # push rows into the scrollable column
-        main_content.controls[4].controls[0].controls.extend(matrix_rows)
-        page.update()
+        try:
+            main_content.controls[4].controls[0].controls.extend(matrix_rows)
+            page.update()
+        except Exception as e:
+            logger.exception("Failed to render UI matrix rows: %s", e)
 
     def apply_dropdown_disabling() -> None:
         """Enable/disable row dropdowns depending on power system mode."""
@@ -788,13 +848,19 @@ def main(page: ft.Page) -> None:
                 dd = matrix.get((region, sector))
                 if not dd:
                     continue
-                if global_settings["power_system_model"]:
-                    dd.disabled = (sector != "Elc")
-                    if sector != "Elc":
-                        dd.value = "NA"
-                else:
-                    dd.disabled = False
-        page.update()
+                try:
+                    if global_settings["power_system_model"]:
+                        dd.disabled = (sector != "Elc")
+                        if sector != "Elc":
+                            dd.value = "NA"
+                    else:
+                        dd.disabled = False
+                except Exception as e:
+                    logger.exception("Error applying disabling for %s|%s: %s", region, sector, e)
+        try:
+            page.update()
+        except Exception:
+            pass
         save_config()
 
     def reset_matrix(e: ft.ControlEvent | None = None) -> None:
@@ -855,7 +921,9 @@ def main(page: ft.Page) -> None:
                 output_filename=output_filename,
             )
             status_text.value = f"Aggregation complete. Output: {output_filename}.sqlite"
+            logger.info("Aggregation finished successfully (input=%s output=%s)", input_filename, output_filename)
         except Exception as ex:
+            logger.exception("Aggregation failed (input=%s output=%s): %s", input_filename, output_filename, ex)
             status_text.value = f"Error: {ex}"
         page.update()
 
