@@ -83,7 +83,7 @@ GENERIC_LOW_BY_SECTOR: Dict[str, Dict[str, str]] = {
 }
 
 HIGH_PREFIXES = {
-    "Ind": "INDHR",
+    "Ind": "GENINDHR",
     "Res": "RESHR",
     "Comm": "COMHR",
     "Tran": "TRPHR",
@@ -91,7 +91,7 @@ HIGH_PREFIXES = {
 
 GENERIC_BY_SECTOR = {
     "Elc": "ELCHR001",
-    "Ind": "INDHR001",
+    "Ind": "GENINDHR001",
     "Res": "RESHR001",
     "Comm": "COMHR001",
     "Tran": "TRPHR001",
