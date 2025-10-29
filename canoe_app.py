@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CANOE UI Script 
+CANOE UI Script (Refactored w/ PSM)
 By David Turnbull
 """
 
@@ -14,7 +14,7 @@ import sqlite3
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
-from typing import Dict, Iterable, List, Set, Tuple
+from typing import Any, Dict, Iterable, List, Set, Tuple
 
 import flet as ft
 import pandas as pd
@@ -186,6 +186,11 @@ def filter_func(output_db: str) -> None:
 
             # Get the efficiency table
             df_eff = pd.read_sql_query('SELECT * FROM Efficiency', conn)
+            
+            if df_eff.empty:
+                logger.debug("Timing pruning skipped: Efficiency table is empty.")
+                finished = True
+                continue
 
             # Last period each process is producing its output commodity
             df_eff['last_out'] = df_eff['vintage'] + [int(lifetime_process[tuple(rtv)]) for rtv in df_eff[['region','tech','vintage']].values]
@@ -195,7 +200,16 @@ def filter_func(output_db: str) -> None:
             df_last_in = df_eff.groupby(['region','input_comm'])['last_out'].max()
             demand_comms = [c[0] for c in curs.execute("SELECT name FROM Commodity WHERE flag == 'd'").fetchall()]
             df_eff = df_eff.loc[~df_eff['output_comm'].isin(demand_comms)]
-            df_eff['last_in'] = [df_last_in.loc[tuple(ro)] for ro in df_eff[['region','output_comm']].values]
+            
+            if df_eff.empty:
+                logger.debug("Timing pruning skipped: No non-demand outputs found.")
+                finished = True
+                continue
+
+            # Handle missing 'last_in' values for outputs that are never consumed
+            df_eff = df_eff.merge(df_last_in.rename('last_in'), left_on=['region', 'output_comm'], right_index=True, how='left')
+            # If an output is never an input, 'last_in' will be NaN. Treat this as 0 (it's never consumed).
+            df_eff['last_in'] = df_eff['last_in'].fillna(0)
 
             # Remove any processes that are producing their output comm after anything is consuming it
             df_remove = df_eff.loc[df_eff['last_in'] < df_eff['last_out']]
@@ -350,12 +364,16 @@ def load_config() -> dict:
 def build_desired_ids_from_matrix(
     matrix: Dict[Tuple[str, str], ft.Dropdown],
     csv_ids: Set[str],
-    global_settings: Dict[str, bool],
+    global_settings: Dict[str, Any], # Holds scenario (str) and psm (bool)
     get_current_regions,
 ) -> Set[str]:
     desired: Set[str] = set()
     selected_regions: Set[str] = set()
     current_regions = get_current_regions()
+    
+    # Get the global settings
+    scenario = global_settings.get("scenario", "Current Measure") # Default to CM
+    is_psm = global_settings.get("power_system_model", False)
 
     # Track whether any Low CM / Low GNZ was chosen per sector (for adding generics)
     low_cm_seen = {"Ind": False, "Res": False, "Comm": False, "Tran": False}
@@ -380,6 +398,7 @@ def build_desired_ids_from_matrix(
             base_el -= csv_match_prefix_region(csv_ids, "ELCHREINT", region)
             base_el -= csv_match_prefix_region(csv_ids, "ELCHRBINT", region)
             desired |= base_el
+        # "Low" for Elc is possible, but has no prefixes
 
     # Non-electric (Ind, Res, Comm, Tran)
     for region in current_regions:
@@ -393,13 +412,15 @@ def build_desired_ids_from_matrix(
             if val == "HIGH":
                 desired |= csv_match_prefix_region(csv_ids, hr_prefix, region)
 
-            elif val == "LOW CM":
-                low_cm_seen[sector] = True
-                desired |= csv_match_prefix_region(csv_ids, LOW_PREFIXES[sector]["CM"], region)
-
-            elif val == "LOW GNZ":
-                low_gnz_seen[sector] = True
-                desired |= csv_match_prefix_region(csv_ids, LOW_PREFIXES[sector]["GNZ"], region)
+            # LOGIC: Check for "LOW" and then check global scenario
+            elif val == "LOW":
+                if scenario == "Current Measure":
+                    low_cm_seen[sector] = True
+                    desired |= csv_match_prefix_region(csv_ids, LOW_PREFIXES[sector]["CM"], region)
+                elif scenario == "Global Net Zero":
+                    low_gnz_seen[sector] = True
+                    desired |= csv_match_prefix_region(csv_ids, LOW_PREFIXES[sector]["GNZ"], region)
+            
             # NA -> do nothing
 
     # After scanning all regions, add generic CM/NZ IDs if that mode was selected anywhere for the sector.
@@ -414,7 +435,8 @@ def build_desired_ids_from_matrix(
                 desired.add(gen_nz)
 
     # DEM (power-system demand expansions)
-    if global_settings.get("power_system_model", False):
+    # RE-ADDED: This logic is conditional on power_system_model
+    if is_psm:
         for r in selected_regions:
             desired |= csv_match_prefix_region(csv_ids, "ELCHRDEM", r)
 
@@ -446,7 +468,8 @@ def build_desired_ids_from_matrix(
             desired |= csv_match_intertie_any(csv_ids, ("ELCHRBINT", "BINT"), a, b)
 
     # AGRI/DIST rules
-    if not global_settings.get("power_system_model", False):
+    # RE-ADDED: This logic is now conditional on power_system_model
+    if not is_psm:
         if "AGRIHR001" in csv_ids:
             desired.add("AGRIHR001")
         for r in selected_regions:
@@ -464,7 +487,8 @@ def build_desired_ids_from_matrix(
         if gen and gen in csv_ids:
             desired.add(gen)
 
-    if global_settings.get("power_system_model", False):
+    # RE-ADDED: Conditional Elc generic
+    if is_psm:
         _maybe_add_generic("Elc")
     else:
         if any((matrix.get((r, "Elc")) and matrix[(r, "Elc")].value != "NA") for r in current_regions):
@@ -474,8 +498,8 @@ def build_desired_ids_from_matrix(
         if any((matrix.get((r, _sec)) and matrix[(r, _sec)].value != "NA") for r in current_regions):
             _maybe_add_generic(_sec)
 
-    # Final guard: never include AGRIHR* in power system model
-    if global_settings.get("power_system_model", False):
+    # RE-ADDED: Final guard for AGRIHR*
+    if is_psm:
         desired = {x for x in desired if not x.startswith("AGRIHR")}
 
     return desired
@@ -487,16 +511,17 @@ def build_desired_ids_from_matrix(
 
 def get_demand_lists_region_aware(
     output_db: str, 
-    conn: sqlite3.Connection, 
+    conn: sqlite3.Connection,
     *,
     power_system_model: bool = False
 ) -> Tuple[List[str], List[str]]:
     """
     Identifies all related commodities and technologies starting from the 'Demand' table.
-    In PSM mode, exclude R_ethos.
+    RE-ADDED: In PSM mode, exclude R_ethos.
     """
     cursor = conn.cursor()
 
+    # RE-ADDED: Logic for R_ethos
     remove: Set[str] = {'R_ethos'} if power_system_model else set()
     ethos_whitelist = ('E_ethos', 'F_ethos') if power_system_model else ('E_ethos', 'F_ethos', 'R_ethos')
 
@@ -549,6 +574,7 @@ def get_demand_lists_region_aware(
         cursor.execute(f"SELECT name FROM Commodity WHERE name IN ({placeholders})", ethos_whitelist)
         commodities.update({row[0] for row in cursor.fetchall()})
 
+        # RE-ADDED: R_ethos removal
         if power_system_model and 'R_ethos' in commodities:
             commodities.discard('R_ethos')
 
@@ -622,7 +648,7 @@ def delete_rows_not_in_regions(conn: sqlite3.Connection, tables: List[str], allo
 def aggregate_sqlite_files(
     matrix: Dict[Tuple[str, str], ft.Dropdown],
     csv_ids: Set[str],
-    global_settings: Dict[str, bool],
+    global_settings: Dict[str, Any], # Holds scenario (str) and psm (bool)
     get_current_regions,
     output_filename: str,
     input_filename: str,
@@ -688,6 +714,7 @@ def aggregate_sqlite_files(
                 continue
 
         # Demand-led pruning
+        # RE-ADDED: Pass power_system_model flag
         com_list, tech_list = get_demand_lists_region_aware(
             output_db, output_conn, power_system_model=global_settings.get("power_system_model", False)
         )
@@ -733,20 +760,37 @@ def main(page: ft.Page) -> None:
 
     # Sectors and options
     sectors = ["Ind", "Res", "Comm", "Elc", "Tran"]
-    levels_other_sectors = ["Low CM", "Low GNZ", "High", "NA"]
-    levels_elc_sector = ["NA", "High"]
-
+    # All sectors use the same levels
+    levels_all_sectors = ["Low", "High", "NA"]
+    
     # UI storage
     matrix: Dict[Tuple[str, str], ft.Dropdown] = {}
 
-    # Global flag (CCS removed)
-    global_settings = {"power_system_model": False}
+    # Global flags
+    global_settings = {
+        "scenario": "Current Measure",    # Default scenario
+        "power_system_model": False # Default PSM
+    }
 
     # Widgets
     status_text = ft.Text("")
     in_filename_text_field = ft.TextField(label="Input file path (e.g. dataset.sqlite)", value="", width=260)
     out_filename_text_field = ft.TextField(label="Output file path (e.g. canoe.sqlite)", value="", width=260)
+    
+    # Scenario Dropdown
+    scenario_dropdown = ft.Dropdown(
+        label="Low-level Scenario",
+        options=[
+            ft.dropdown.Option("Current Measure"),
+            ft.dropdown.Option("Global Net Zero"),
+        ],
+        value="Current Measure", # Default
+        width=200,
+    )
+    
+    # RE-ADDED: Power System Checkbox
     power_system_checkbox = ft.Checkbox(label="Power system model", value=False)
+    
     image = ft.Container(content=ft.Image(src="./assets/logo.png", height=50, width=60), alignment=ft.alignment.top_right)
 
     # load saved config (will be applied once UI elements are created)
@@ -758,7 +802,8 @@ def main(page: ft.Page) -> None:
             cfg = {
                 "input_filename": (in_filename_text_field.value or "").strip(),
                 "output_filename": (out_filename_text_field.value or "").strip(),
-                "power_system_model": bool(power_system_checkbox.value),
+                "scenario": (scenario_dropdown.value or "Current Measure"),
+                "power_system_model": bool(power_system_checkbox.value), # RE-ADDED
                 "matrix": { f"{r}|{s}": (matrix[(r, s)].value if (r, s) in matrix and matrix[(r, s)] is not None else None)
                             for (r, s) in matrix.keys() },
             }
@@ -781,6 +826,7 @@ def main(page: ft.Page) -> None:
         current_region = e.control.data
         is_na_selected = (e.control.value == "NA")
 
+        # RE-ADDED: Do not auto-fill if in power system mode
         if not global_settings["power_system_model"]:
             if is_na_selected:
                 # if entire row inactive, keep row NA
@@ -794,21 +840,22 @@ def main(page: ft.Page) -> None:
                         if dd:
                             dd.value = "NA"
             else:
-                # if any is selected, default others (Elc=High, others Low CM)
+                # if any is selected, default others (Elc=High, others Low)
                 for s in sectors:
                     dd = matrix.get((current_region, s))
                     if not dd:
                         continue
                     if s != "Elc" and dd.value == "NA":
-                        dd.value = "Low CM"
+                        dd.value = "Low"
                     elif s == "Elc" and dd.value == "NA":
                         dd.value = "High"
+        
         # persist change
         save_config()
         page.update()
 
     def update_ui_matrix() -> None:
-        """Rebuild the matrix rows whenever regions set changes."""
+        """Rebuild the matrix rows."""
         # clear matrix grid container (index 4 -> matrix area)
         try:
             main_content.controls[4].controls[0].controls.clear()
@@ -827,14 +874,15 @@ def main(page: ft.Page) -> None:
         for region in current_regions:
             row_elements = [ft.Text(region, weight=ft.FontWeight.BOLD, width=120)]
             for sector in sectors:
+                # RE-ADDED: PSM check for initial disabled state
                 initial_disabled_state = global_settings["power_system_model"] and sector != "Elc"
-                options = levels_elc_sector if sector == "Elc" else levels_other_sectors
+                
                 dd = ft.Dropdown(
-                    options=[ft.dropdown.Option(level) for level in options],
+                    options=[ft.dropdown.Option(level) for level in levels_all_sectors],
                     value="NA",
                     width=80,
                     content_padding=ft.padding.only(left=5, right=5),
-                    disabled=initial_disabled_state,
+                    disabled=initial_disabled_state, # Apply PSM state
                 )
                 matrix[(region, sector)] = dd
                 row_elements.append(dd)
@@ -851,7 +899,8 @@ def main(page: ft.Page) -> None:
                             dd.value = val
                 except Exception as e:
                     logger.exception("Failed applying saved value for %s|%s: %s", region, sector, e)
-                # If power-system model is active, non-Elc sectors must be disabled/NA
+                
+                # RE-ADDED: Enforce power-system rule AFTER loading saved value
                 try:
                     if global_settings.get("power_system_model", False) and sector != "Elc":
                         dd.value = "NA"
@@ -869,7 +918,9 @@ def main(page: ft.Page) -> None:
             logger.exception("Failed to render UI matrix rows: %s", e)
 
     def apply_dropdown_disabling() -> None:
-        """Enable/disable row dropdowns depending on power system mode."""
+        """
+        RE-ADDED: Enable/disable row dropdowns depending on power system mode.
+        """
         for region in get_current_regions():
             for sector in sectors:
                 dd = matrix.get((region, sector))
@@ -891,13 +942,16 @@ def main(page: ft.Page) -> None:
         save_config()
 
     def reset_matrix(e: ft.ControlEvent | None = None) -> None:
-        """Hard reset: turn off PSM, set all cells to 'NA', re-enable controls,
-        clear status text, and overwrite the saved config so the UI won't repopulate."""
+        """Hard reset: reset all settings, set all cells to 'NA', re-enable controls,
+        clear status text, and overwrite the saved config."""
         nonlocal saved_cfg
     
-        # 1) Reset global flags / checkbox
-        global_settings["power_system_model"] = False
-        power_system_checkbox.value = False
+        # 1) Reset global flags / controls
+        default_scenario = "Current Measure"
+        global_settings["scenario"] = default_scenario
+        global_settings["power_system_model"] = False # RE-ADDED
+        scenario_dropdown.value = default_scenario
+        power_system_checkbox.value = False # RE-ADDED
     
         # 2) Reset all dropdowns in the current matrix
         for (r, s), dd in matrix.items():
@@ -908,11 +962,11 @@ def main(page: ft.Page) -> None:
         status_text.value = ""
     
         # 4) Overwrite saved config in-memory and on-disk with a clean matrix
-        #    (keep file paths as-is so the user doesn't lose them)
         saved_cfg = {
             "input_filename": (in_filename_text_field.value or "").strip(),
             "output_filename": (out_filename_text_field.value or "").strip(),
-            "power_system_model": False,
+            "scenario": default_scenario,
+            "power_system_model": False, # RE-ADDED
             "matrix": {f"{r}|{s}": "NA" for (r, s) in matrix.keys()},
         }
         try:
@@ -935,6 +989,14 @@ def main(page: ft.Page) -> None:
 
     # --- Settings events ---
 
+    def on_scenario_change(e: ft.ControlEvent) -> None:
+        """Handle change for the scenario dropdown."""
+        global_settings["scenario"] = str(e.control.value)
+        save_config()
+    
+    scenario_dropdown.on_change = on_scenario_change
+    
+    # RE-ADDED: Handler for power system checkbox
     def on_power_system_change(e: ft.ControlEvent) -> None:
         global_settings["power_system_model"] = bool(e.control.value)
         update_ui_matrix()
@@ -982,7 +1044,7 @@ def main(page: ft.Page) -> None:
                 input_filename=input_filename,
                 output_filename=output_filename,
             )
-            status_text.value = f"Aggregation complete. Output: {output_filename}.sqlite"
+            status_text.value = f"Aggregation complete. Output: {output_filename}"
             logger.info("Aggregation finished successfully (input=%s output=%s)", input_filename, output_filename)
         except Exception as ex:
             logger.exception("Aggregation failed (input=%s output=%s): %s", input_filename, output_filename, ex)
@@ -998,9 +1060,9 @@ def main(page: ft.Page) -> None:
     for region in ALL_REGIONS:
         row_elements = [ft.Text(region, weight=ft.FontWeight.BOLD, width=120)]
         for sector in sectors:
-            options = levels_elc_sector if sector == "Elc" else levels_other_sectors
+            # All sectors use same options
             dd = ft.Dropdown(
-                options=[ft.dropdown.Option(level) for level in options],
+                options=[ft.dropdown.Option(level) for level in levels_all_sectors],
                 value="NA",
                 width=80,
                 content_padding=ft.padding.only(left=5, right=5),
@@ -1012,15 +1074,22 @@ def main(page: ft.Page) -> None:
             dd.on_change = on_sector_dropdown_change
         matrix_rows.append(ft.Row(row_elements, alignment=ft.MainAxisAlignment.START))
 
-    # Apply saved text inputs / checkbox if present
+    # Apply saved text inputs / controls if present
     try:
         if saved_cfg:
             in_filename_text_field.value = saved_cfg.get("input_filename", in_filename_text_field.value)
             out_filename_text_field.value = saved_cfg.get("output_filename", out_filename_text_field.value)
-            # apply saved checkbox AND reflect it in global_settings so UI logic runs correctly
+            
+            # Apply saved scenario
+            scenario_saved = saved_cfg.get("scenario", scenario_dropdown.value)
+            scenario_dropdown.value = scenario_saved
+            global_settings["scenario"] = scenario_saved
+            
+            # RE-ADDED: Apply saved PSM checkbox
             psm_saved = bool(saved_cfg.get("power_system_model", power_system_checkbox.value))
             power_system_checkbox.value = psm_saved
             global_settings["power_system_model"] = psm_saved
+            
     except Exception:
         pass
 
@@ -1028,12 +1097,14 @@ def main(page: ft.Page) -> None:
     reset_button = ft.ElevatedButton("Reset Matrix", on_click=reset_matrix)
     submit_button = ft.ElevatedButton("Submit", on_click=on_submit)
 
-    # Settings column — layout preserved (CCS checkbox removed)
+    # Settings column
     settings_column = ft.Column(
         [
             ft.Text("Aggregation Settings", size=18, weight=ft.FontWeight.BOLD),
             ft.Divider(),
-            power_system_checkbox,
+            scenario_dropdown,
+            power_system_checkbox, # RE-ADDED
+            ft.Divider(),
             reset_button,
         ],
         alignment=ft.MainAxisAlignment.START,
@@ -1082,7 +1153,7 @@ def main(page: ft.Page) -> None:
 
     # Build matrix from saved state first, then enforce disabling rules
     update_ui_matrix()
-    apply_dropdown_disabling()
+    apply_dropdown_disabling() # This will now apply PSM rules if loaded from config
 
 if __name__ == "__main__":
     ft.app(target=main, assets_dir="./assets")
