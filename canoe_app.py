@@ -15,7 +15,6 @@ import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Set, Tuple
-
 import flet as ft
 import pandas as pd
 
@@ -172,19 +171,26 @@ ALL_ALIAS_TOKENS = sorted(
 CONFLICT_SUFFIXES = {
     t: [u for u in ALL_ALIAS_TOKENS if u != t and u.endswith(t)] for t in ALL_ALIAS_TOKENS
 }
-def split_intertie_tech(tech: str, codes: set[str]) -> tuple[str,str,str] | None:
+def split_intertie_tech(tech: str, codes: set[str]) -> tuple[str, str, str] | None:
     """
-    Parse tech names like 'EINTABBC', 'BINTABUSA', returning (kind, origin, dest)
-    where origin/dest are canonical region codes. Returns None if not an intertie.
+    Accepts EINT/BINT and ELCHREINT/ELCHRBINT.
+    Returns (kind, origin, dest) with canonical region codes.
     """
-    if not tech or len(tech) < 9:
+    if not tech:
         return None
-    kind = tech[:4]
-    if kind not in ("EINT", "BINT"):
-        return None
-    rest = tech[4:].upper()
+    t = tech.upper()
 
-    # longest-match split to handle variable-length codes (e.g., PEI, NLLAB)
+    # Allow ELCHR prefix (electricity wrapper)
+    if t.startswith("ELCHR"):
+        t = t[5:]
+
+    if not (t.startswith("EINT") or t.startswith("BINT")):
+        return None
+
+    kind = t[:4]
+    rest = t[4:]
+
+    # longest-match split for variable-length codes (PEI, NLLAB)
     first = None
     for c in sorted(codes, key=len, reverse=True):
         if rest.startswith(c):
@@ -192,6 +198,7 @@ def split_intertie_tech(tech: str, codes: set[str]) -> tuple[str,str,str] | None
             break
     if not first:
         return None
+
     second_raw = rest[len(first):]
     second = None
     for c in sorted(codes, key=len, reverse=True):
@@ -200,33 +207,143 @@ def split_intertie_tech(tech: str, codes: set[str]) -> tuple[str,str,str] | None
             break
     if not second:
         return None
+
     return kind, canon_region(first), canon_region(second)
+
 # ------------------------------
 # Post-Aggregation Filter / Cleanup
 # ------------------------------
+def _trailing_region_token(data_id: str) -> str | None:
+    """
+    Return the trailing region token if the data_id ends with a region alias
+    (optionally followed by a 3-digit code), preferring the longest alias first
+    (e.g., NLLAB over LAB). Otherwise, None.
+    """
+    if not data_id:
+        return None
+    u = data_id.upper()
+    # Longest-first to avoid matching AB in NLLAB
+    for tok in sorted({t for fam in REGION_ALIASES.values() for t in fam}, key=len, reverse=True):
+        if u.endswith(tok) or re.search(rf"{re.escape(tok)}\d{{3}}$", u):
+            return tok
+    return None
+
+
+def _is_intertie_data_id(u: str) -> bool:
+    u = u.upper()
+    return u.startswith("ELCHREINT") or u.startswith("ELCHRBINT") or u.startswith("EINT") or u.startswith("BINT")
+
+
+def prune_unselected_data_ids(conn: sqlite3.Connection, selected_regions: list[str]) -> None:
+    """
+    Remove rows from ANY table that has a 'data_id' column if the data_id encodes
+    an unselected region. Interties are handled directionally (origin/dest rules).
+    Must be run BEFORE pinning.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [t[0] for t in cur.fetchall()]
+    except sqlite3.Error:
+        return
+
+    # Build allowed alias token set from selected regions
+    allowed_tokens: set[str] = set()
+    for r in (selected_regions or []):
+        for tok in REGION_ALIASES.get(canon_region(r), [canon_region(r)]):
+            allowed_tokens.add(tok)
+
+    # Codes for intertie parsing
+    codes = collect_known_codes_from_db(conn)
+
+    cur.execute("PRAGMA foreign_keys = OFF;")
+
+    for t in tables:
+        try:
+            cols = [c[1] for c in cur.execute(f"PRAGMA table_info({t});")]
+            if "data_id" not in cols:
+                continue
+
+            # Collect candidate data_ids in this table
+            cur.execute(f"SELECT DISTINCT data_id FROM {t} WHERE data_id IS NOT NULL;")
+            ids = [row[0] for row in cur.fetchall() if row and row[0]]
+
+            drop_ids: list[str] = []
+            for did in ids:
+                u = did.upper()
+
+                # Intertie: decide by origin/dest
+                if _is_intertie_data_id(u):
+                    parsed = split_intertie_tech(u, codes)
+                    if not parsed:
+                        # If we can't parse, be conservative: drop if it clearly ends in a non-allowed region token
+                        tok = _trailing_region_token(u)
+                        if tok and tok not in allowed_tokens:
+                            drop_ids.append(did)
+                        continue
+
+                    kind, origin, dest = parsed
+                    origin, dest = canon_region(origin), canon_region(dest)
+
+                    if kind == "EINT":
+                        # keep only if BOTH selected
+                        if not (origin in map(canon_region, selected_regions) and dest in map(canon_region, selected_regions)):
+                            drop_ids.append(did)
+                    else:  # BINT
+                        # keep only if ORIGIN selected
+                        if origin not in map(canon_region, selected_regions):
+                            drop_ids.append(did)
+                    continue
+
+                # Non-intertie: check trailing region token; keep generics (no token)
+                tok = _trailing_region_token(u)
+                if tok is None:
+                    # generic/no region suffix — keep
+                    continue
+                # keep only if token belongs to allowed regions
+                if tok not in allowed_tokens:
+                    drop_ids.append(did)
+
+            if drop_ids:
+                placeholders = ",".join("?" for _ in drop_ids)
+                try:
+                    cur.execute(f"DELETE FROM {t} WHERE data_id IN ({placeholders});", drop_ids)
+                except sqlite3.Error:
+                    pass
+
+        except sqlite3.Error:
+            continue
+
+    conn.commit()
+    try:
+        cur.execute("PRAGMA foreign_keys = ON;")
+    except sqlite3.Error:
+        pass
+
 def prune_unrequested_interties(conn: sqlite3.Connection, selected_regions: list[str]) -> None:
     """
     Remove intertie technologies (and their rows in related tables) that *originate* in
-    unselected regions. Rules:
-      - EINT (endogenous): keep only if BOTH origin and dest are selected (keep both directions).
-      - BINT (boundary): keep only if ORIGIN is selected (dest may be unselected like USA/SK/etc).
-    Everything else is dropped.
+    unselected regions.
+      - EINT/ELCHREINT: keep only if BOTH origin and dest are selected.
+      - BINT/ELCHRBINT: keep only if ORIGIN is selected (dest can be unselected).
     """
     sel = {canon_region(r) for r in (selected_regions or [])}
     cur = conn.cursor()
 
-    # Build region code universe (handles PE->PEI, NL/LAB->NLLAB, etc.)
     codes = collect_known_codes_from_db(conn)
 
-    # Find all intertie techs
+    # Include ELCHR* as well as plain EINT/BINT
     try:
-        cur.execute("SELECT DISTINCT tech FROM Technology WHERE tech LIKE 'EINT%' OR tech LIKE 'BINT%';")
+        cur.execute("""
+            SELECT DISTINCT tech FROM Technology
+            WHERE tech LIKE 'EINT%' OR tech LIKE 'BINT%'
+               OR tech LIKE 'ELCHREINT%' OR tech LIKE 'ELCHRBINT%';
+        """)
         techs = [t[0] for t in cur.fetchall()]
     except sqlite3.Error:
         techs = []
 
     drop_set: set[str] = set()
-    keep_set: set[str] = set()
 
     for t in techs:
         parsed = split_intertie_tech(t, codes)
@@ -235,23 +352,16 @@ def prune_unrequested_interties(conn: sqlite3.Connection, selected_regions: list
         kind, origin, dest = parsed
 
         if kind == "EINT":
-            # Keep iff BOTH selected; keep both directions naturally
-            if origin in sel and dest in sel:
-                keep_set.add(t)
-            else:
+            if not (origin in sel and dest in sel):
                 drop_set.add(t)
         else:  # BINT
-            # Keep iff ORIGIN is selected (dest can be anything)
-            if origin in sel:
-                keep_set.add(t)
-            else:
+            if origin not in sel:
                 drop_set.add(t)
 
-    # Nothing to do?
     if not drop_set:
         return
 
-    # Identify all tables with a 'tech' column
+    # Delete across all tables with a 'tech' column
     try:
         cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
         tables = [t[0] for t in cur.fetchall()]
@@ -267,7 +377,6 @@ def prune_unrequested_interties(conn: sqlite3.Connection, selected_regions: list
         except sqlite3.Error:
             pass
 
-    # Delete in all tech tables (before creating pins)
     cur.execute("PRAGMA foreign_keys = OFF;")
     placeholders = ",".join("?" for _ in drop_set)
     params = list(drop_set)
@@ -278,7 +387,6 @@ def prune_unrequested_interties(conn: sqlite3.Connection, selected_regions: list
         except sqlite3.Error:
             pass
 
-    # Also remove any orphan Technology rows in case Technology didn't have 'tech' (it does, but be safe)
     try:
         cur.execute(f"DELETE FROM Technology WHERE tech IN ({placeholders});", params)
     except sqlite3.Error:
@@ -286,117 +394,173 @@ def prune_unrequested_interties(conn: sqlite3.Connection, selected_regions: list
 
     conn.commit()
 
+
 def filter_func(output_db: str, pinned_techs: Set[str] | None = None) -> None:
-    """Run cleanup transformations on the aggregated SQLite file, never touching pinned techs."""
-    pinned_techs = pinned_techs or set()
+    """
+    Cleanup with safeguards:
+      - Caps each loop to 20 iterations
+      - Breaks if a pass makes no progress
+      - Uses CAST(vintage AS INTEGER) for type-safe deletes
+    """
+    pinned_techs = set(pinned_techs or [])
+    MAX_ITERS_PASS1 = 20
+    MAX_ITERS_PASS2 = 20
+
     try:
         conn = sqlite3.connect(output_db)
         curs = conn.cursor()
+        try:
+            curs.execute("PRAGMA foreign_keys = OFF;")
+            curs.execute("PRAGMA temp_store = MEMORY;")
+            curs.execute("PRAGMA synchronous = OFF;")
+            curs.execute("PRAGMA journal_mode = MEMORY;")
+        except sqlite3.Error:
+            pass
 
-        # ---- Pass 1: orphan region-tech pruning (skip pinned) ----
-        finished = False
-        while not finished:
+        # ---- Pass 1: orphan region-tech pruning ----
+        for it in range(1, MAX_ITERS_PASS1 + 1):
             bad_rt = curs.execute(
                 """
-                SELECT region, tech 
+                SELECT DISTINCT region, tech
                 FROM Efficiency 
-                WHERE output_comm NOT IN (SELECT name FROM Commodity WHERE flag == 'd')
-                  AND (region, output_comm) NOT IN (
-                        SELECT region, input_comm FROM Efficiency
-                  )
+                WHERE output_comm NOT IN (SELECT name FROM Commodity WHERE flag = 'd')
+                  AND (region, output_comm) NOT IN (SELECT region, input_comm FROM Efficiency)
                 """
             ).fetchall()
-            # skip pinned techs
             bad_rt = [rt for rt in bad_rt if rt[1] not in pinned_techs]
+            if not bad_rt:
+                break
 
+            deleted_total = 0
             tables = [t[0] for t in curs.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]
-
             for table in tables:
                 cols = [c[1] for c in curs.execute(f'PRAGMA table_info({table});')]
                 if 'region' in cols and 'tech' in cols:
-                    for rt in bad_rt:
-                        if rt[1] in pinned_techs:
-                            continue
-                        curs.execute(f"DELETE FROM {table} WHERE region == ? AND tech == ?", (rt[0], rt[1]))
+                    for region, tech in bad_rt:
+                        try:
+                            curs.execute(f"DELETE FROM {table} WHERE region = ? AND tech = ?", (region, tech))
+                            if curs.rowcount and curs.rowcount > 0:
+                                deleted_total += curs.rowcount
+                        except sqlite3.Error:
+                            pass
 
             tech_remaining = {t[0] for t in curs.execute('SELECT DISTINCT tech FROM Efficiency').fetchall()}
-            tech_before = {t[0] for t in curs.execute('SELECT DISTINCT tech FROM Technology').fetchall()}
-            tech_gone = (tech_before - tech_remaining) - pinned_techs  # never remove pinned
+            tech_before    = {t[0] for t in curs.execute('SELECT DISTINCT tech FROM Technology').fetchall()}
+            tech_gone = (tech_before - tech_remaining) - pinned_techs
+            if tech_gone:
+                for table in tables:
+                    cols = [c[1] for c in curs.execute(f'PRAGMA table_info({table});')]
+                    if 'tech' in cols:
+                        for tech in tech_gone:
+                            try:
+                                curs.execute(f"DELETE FROM {table} WHERE tech = ?", (tech,))
+                                if curs.rowcount and curs.rowcount > 0:
+                                    deleted_total += curs.rowcount
+                            except sqlite3.Error:
+                                pass
 
-            for table in tables:
-                cols = [c[1] for c in curs.execute(f'PRAGMA table_info({table});')]
-                if 'tech' in cols:
-                    for tech in tech_gone:
-                        if tech in pinned_techs:
-                            continue
-                        curs.execute(f'DELETE FROM {table} WHERE tech == ?', (tech,))
+            conn.commit()
+            if deleted_total == 0:
+                logger.warning("Pass1 made no progress in iter %d; stopping to avoid endless loop.", it)
+                break
 
-            logger.debug("Pruned %d orphan region-tech pairs, %d orphan techs (pinned respected)", len(bad_rt), len(tech_gone))
-            finished = len(bad_rt) == 0
+        # ---- Pass 2: timing pruning ----
+        for it in range(1, MAX_ITERS_PASS2 + 1):
+            time_all = [p[0] for p in curs.execute('SELECT period FROM TimePeriod').fetchall()]
+            if not time_all:
+                break
+            time_all_int = []
+            for x in time_all:
+                try: time_all_int.append(int(x))
+                except Exception: pass
+            if not time_all_int:
+                break
 
-        # ---- Pass 2: timing pruning (skip pinned) ----
-        finished = False
-        while not finished:
-            time_all = [p[0] for p in curs.execute('SELECT period FROM TimePeriod').fetchall()][:-1]
+            lifetime_process: Dict[Tuple[str,str,int], int] = {}
+            DEFAULT_LT = 40
 
-            lifetime_process = {}
             for r, t, v in curs.execute('SELECT region, tech, vintage FROM Efficiency').fetchall():
-                lifetime_process[(r, t, v)] = 40
+                try: vi = int(v)
+                except Exception: continue
+                lifetime_process[(r, t, vi)] = DEFAULT_LT
+
             for r, t, lt in curs.execute('SELECT region, tech, lifetime FROM LifetimeTech').fetchall():
-                for v in time_all:
-                    lifetime_process[(r, t, v)] = lt
+                try: lti = int(lt)
+                except Exception: continue
+                for v in time_all_int:
+                    lifetime_process[(r, t, v)] = lti
+
             for r, t, v, lp in curs.execute('SELECT region, tech, vintage, lifetime FROM LifetimeProcess').fetchall():
-                lifetime_process[(r, t, v)] = lp
+                try: vi = int(v); lpi = int(lp)
+                except Exception: continue
+                lifetime_process[(r, t, vi)] = lpi
 
             df_eff = pd.read_sql_query('SELECT * FROM Efficiency', conn)
             if df_eff.empty:
-                logger.debug("Timing pruning skipped: Efficiency table is empty.")
-                finished = True
-                continue
+                break
+            df_eff['vintage'] = pd.to_numeric(df_eff['vintage'], errors='coerce').fillna(0).astype(int)
 
-            df_eff['last_out'] = df_eff['vintage'] + [int(lifetime_process[tuple(rtv)]) for rtv in df_eff[['region','tech','vintage']].values]
-            df_eff['last_out'] = [min(2050, 5 * ((p - 1) // 5)) for p in df_eff['last_out']]
+            def snap5(y: int) -> int:
+                try: y = int(y)
+                except Exception: return 0
+                return min(2050, (y // 5) * 5)
 
-            df_last_in = df_eff.groupby(['region','input_comm'])['last_out'].max()
-            demand_comms = [c[0] for c in curs.execute("SELECT name FROM Commodity WHERE flag == 'd'").fetchall()]
-            df_eff = df_eff.loc[~df_eff['output_comm'].isin(demand_comms)]
+            df_eff['last_out'] = [
+                snap5(v + int(lifetime_process.get((r, t, v), DEFAULT_LT)))
+                for r, t, v in df_eff[['region','tech','vintage']].itertuples(index=False, name=None)
+            ]
+            demand_comms = {c[0] for c in curs.execute("SELECT name FROM Commodity WHERE flag = 'd'").fetchall()}
+            df_nd = df_eff.loc[~df_eff['output_comm'].isin(demand_comms)].copy()
+            if df_nd.empty:
+                break
 
-            if df_eff.empty:
-                logger.debug("Timing pruning skipped: No non-demand outputs found.")
-                finished = True
-                continue
+            df_last_in = (
+                df_eff.groupby(['region','input_comm'], as_index=True)['last_out']
+                      .max()
+                      .rename('last_in')
+            )
+            df_nd = df_nd.merge(df_last_in, left_on=['region','output_comm'], right_index=True, how='left')
+            df_nd['last_in'] = pd.to_numeric(df_nd['last_in'], errors='coerce').fillna(0).astype(int)
 
-            df_eff = df_eff.merge(df_last_in.rename('last_in'), left_on=['region', 'output_comm'], right_index=True, how='left')
-            df_eff['last_in'] = df_eff['last_in'].fillna(0)
-
-            df_remove = df_eff.loc[df_eff['last_in'] < df_eff['last_out']]
-            # Don't remove pinned techs
-            if not pinned_techs:
-                bad_rows = df_remove[['region','input_comm','tech','vintage','output_comm']].values
-            else:
+            df_remove = df_nd.loc[df_nd['last_in'] < df_nd['last_out']].copy()
+            if pinned_techs:
                 df_remove = df_remove[~df_remove['tech'].isin(pinned_techs)]
-                bad_rows = df_remove[['region','input_comm','tech','vintage','output_comm']].values
+            if df_remove.empty:
+                break
 
-            for region, input_comm, tech, vintage, output_comm in bad_rows:
-                curs.execute(
-                    """
-                    DELETE FROM Efficiency 
-                    WHERE region = ? AND input_comm = ? AND tech = ? AND vintage = ? AND output_comm = ?
-                    """,
-                    (region, input_comm, tech, vintage, output_comm),
-                )
-                for tbl in ("CostVariable", "CostFixed", "EmissionActivity"):
+            deleted_total = 0
+            for region, input_comm, tech, vintage, output_comm in df_remove[['region','input_comm','tech','vintage','output_comm']].itertuples(index=False, name=None):
+                try:
                     curs.execute(
-                        f"DELETE FROM {tbl} WHERE region = ? AND tech = ? AND vintage = ?",
-                        (region, tech, vintage),
+                        """
+                        DELETE FROM Efficiency 
+                        WHERE region = ? AND input_comm = ? AND tech = ?
+                          AND CAST(vintage AS INTEGER) = ?
+                          AND output_comm = ?
+                        """, (region, input_comm, tech, int(vintage), output_comm)
                     )
+                    if curs.rowcount and curs.rowcount > 0: deleted_total += curs.rowcount
+                    for tbl in ("CostVariable", "CostFixed", "EmissionActivity"):
+                        try:
+                            curs.execute(
+                                f"DELETE FROM {tbl} WHERE region = ? AND tech = ? AND CAST(vintage AS INTEGER) = ?",
+                                (region, tech, int(vintage))
+                            )
+                            if curs.rowcount and curs.rowcount > 0: deleted_total += curs.rowcount
+                        except sqlite3.Error:
+                            pass
+                except sqlite3.Error:
+                    pass
 
-            logger.debug("Pruned %d timing-infeasible Efficiency rows (pinned respected)", len(bad_rows))
-            finished = len(bad_rows) == 0
+            conn.commit()
+            if deleted_total == 0:
+                logger.warning("Pass2 made no progress in iter %d; stopping to avoid endless loop.", it)
+                break
 
-        conn.commit()
-        conn.close()
-        logger.debug("filter_func completed for %s", output_db)
+        try: curs.execute("PRAGMA foreign_keys = ON;")
+        except sqlite3.Error: pass
+
+        conn.commit(); conn.close()
     except Exception as e:
         logger.exception("filter_func failed for %s: %s", output_db, e)
 
@@ -548,86 +712,135 @@ def load_config() -> dict:
 # Desired IDs Builder (CCS removed)
 # ------------------------------
 
+
+
 def build_desired_ids_from_matrix(
     matrix: Dict[Tuple[str, str], ft.Dropdown],
     csv_ids: Set[str],
-    global_settings: Dict[str, Any], # Holds scenario (str) and psm (bool)
+    global_settings: Dict[str, Any],
     get_current_regions,
 ) -> Set[str]:
-    desired: Set[str] = set()
+    """
+    Use only ids that actually exist in the current DB (csv_ids).
+    Interties are *directional*: endogenous keeps both ways iff both regions selected;
+    boundary keeps only origin->dest when origin is selected.
+    """
+    # --- local helpers to avoid relying on globals ---
+    ALIAS_MAP = {"PE": "PEI", "NL": "NLLAB", "LAB": "NLLAB"}
+    def canon_region(code: str) -> str:
+        return ALIAS_MAP.get((code or "").upper(), (code or "").upper())
+    def region_alias_tokens(code: str) -> Set[str]:
+        c = canon_region(code)
+        if c == "PEI": return {"PEI", "PE"}
+        if c == "NLLAB": return {"NLLAB", "NL", "LAB"}
+        return {c}
+    def csv_match_intertie_dir(ids: Iterable[str], prefix: str, origin: str, dest: str) -> Set[str]:
+        ot, dt = region_alias_tokens(origin), region_alias_tokens(dest)
+        out: Set[str] = set()
+        for _id in ids:
+            u = _id.upper()
+            if not u.startswith(prefix): 
+                continue
+            for o in ot:
+                for d in dt:
+                    if u.startswith(prefix + o + d):
+                        out.add(_id); break
+                else:
+                    continue
+                break
+        return out
+    def csv_match_intertie_dir_any(ids: Iterable[str], prefixes: Iterable[str], origin: str, dest: str) -> Set[str]:
+        out: Set[str] = set()
+        for p in prefixes:
+            out |= csv_match_intertie_dir(ids, p, origin, dest)
+        return out
+
+    # read global flags
+    scenario = global_settings.get("scenario", "Current Measure")
+    is_psm  = bool(global_settings.get("power_system_model", False))
+
+    # which regions are actually active in the UI (row not all NA)
+    try:
+        current_regions = list(get_current_regions()) or []
+    except Exception:
+        current_regions = []
+
     selected_regions: Set[str] = set()
-    current_regions = get_current_regions()
-    
-    # Get the global settings
-    scenario = global_settings.get("scenario", "Current Measure") # Default to CM
-    is_psm = global_settings.get("power_system_model", False)
-
-    # Track whether any Low CM / Low GNZ was chosen per sector (for adding generics)
-    low_cm_seen = {"Ind": False, "Res": False, "Comm": False, "Tran": False}
-    low_gnz_seen = {"Ind": False, "Res": False, "Comm": False, "Tran": False}
-
-    # Active regions
-    for region in current_regions:
+    for r in current_regions:
         row_active = any(
-            (matrix.get((region, s)) and matrix[(region, s)].value != "NA")
-            for s in HIGH_PREFIXES.keys() | {"Elc"}
+            (matrix.get((r, s)) and str(matrix[(r, s)].value).upper() != "NA")
+            for s in {"Ind","Res","Comm","Elc","Tran"}
         )
         if row_active:
-            selected_regions.add(region)
+            selected_regions.add(r)
 
-    # Electricity (High only)
-    for region in current_regions:
-        dd = matrix.get((region, "Elc"))
+    desired: Set[str] = set()
+
+    # electricity (High only; drop DEM/EINT/BINT here; they’re added explicitly below)
+    for r in current_regions:
+        dd = matrix.get((r, "Elc"))
         if dd and str(dd.value).strip().upper() == "HIGH":
-            base_el = csv_match_prefix_region(csv_ids, "ELCHR", region)
-            # Exclude DEM/EINT/BINT; CCS removed entirely
-            base_el -= csv_match_prefix_region(csv_ids, "ELCHRDEM", region)
-            base_el -= csv_match_prefix_region(csv_ids, "ELCHREINT", region)
-            base_el -= csv_match_prefix_region(csv_ids, "ELCHRBINT", region)
-            desired |= base_el
-        # "Low" for Elc is possible, but has no prefixes
+            base = {x for x in csv_ids if x.startswith("ELCHR")}
+            base -= {x for x in base if x.startswith("ELCHRDEM")}
+            base -= {x for x in base if x.startswith("ELCHREINT")}
+            base -= {x for x in base if x.startswith("ELCHRBINT")}
+            desired |= {x for x in base if any(x.endswith(tok) or x.endswith(tok + "001") for tok in region_alias_tokens(r))}
 
-    # Non-electric (Ind, Res, Comm, Tran)
-    for region in current_regions:
-        for sector, hr_prefix in HIGH_PREFIXES.items():
-            dd = matrix.get((region, sector))
-            if not dd:
+    # non-electric sectors
+    LOW_PREFIXES = {"Ind":{"CM":"INDCM","GNZ":"INDNZ"}, "Res":{"CM":"RESCM","GNZ":"RESNZ"},
+                    "Comm":{"CM":"COMCM","GNZ":"COMNZ"}, "Tran":{"CM":"TRPCM","GNZ":"TRPNZ"}}
+    HIGH_PREFIXES = {"Ind":"GENINDHR", "Res":"RESHR", "Comm":"COMHR", "Tran":"TRPHR"}
+    GENERIC_LOW_BY_SECTOR = {"Ind":{"CM":"INDCM001","GNZ":"INDNZ001"},
+                             "Res":{"CM":"RESCM001","GNZ":"RESNZ001"},
+                             "Comm":{"CM":"COMCM001","GNZ":"COMNZ001"},
+                             "Tran":{"CM":"TRPCM001","GNZ":"TRPNZ001"}}
+
+    low_cm_seen  = {k: False for k in LOW_PREFIXES}
+    low_gnz_seen = {k: False for k in LOW_PREFIXES}
+
+    def match_prefix_region(ids: Iterable[str], prefix: str, r: str) -> Set[str]:
+        toks = region_alias_tokens(r)
+        out: Set[str] = set()
+        for _id in ids:
+            if not _id.startswith(prefix): 
                 continue
+            if not re.search(r"\d{3}$", _id): 
+                continue
+            if any(_id.endswith(tok) or re.search(rf"{re.escape(tok)}\d{{3}}$", _id) for tok in toks):
+                out.add(_id)
+        return out
 
+    for r in current_regions:
+        for sector, hr in HIGH_PREFIXES.items():
+            dd = matrix.get((r, sector))
+            if not dd: 
+                continue
             val = (str(dd.value) or "").strip().upper()
-
             if val == "HIGH":
-                desired |= csv_match_prefix_region(csv_ids, hr_prefix, region)
-
-            # LOGIC: Check for "LOW" and then check global scenario
+                desired |= match_prefix_region(csv_ids, hr, r)
             elif val == "LOW":
                 if scenario == "Current Measure":
                     low_cm_seen[sector] = True
-                    desired |= csv_match_prefix_region(csv_ids, LOW_PREFIXES[sector]["CM"], region)
+                    desired |= match_prefix_region(csv_ids, LOW_PREFIXES[sector]["CM"], r)
                 elif scenario == "Global Net Zero":
                     low_gnz_seen[sector] = True
-                    desired |= csv_match_prefix_region(csv_ids, LOW_PREFIXES[sector]["GNZ"], region)
-            
-            # NA -> do nothing
+                    desired |= match_prefix_region(csv_ids, LOW_PREFIXES[sector]["GNZ"], r)
 
-    # After scanning all regions, add generic CM/NZ IDs if that mode was selected anywhere for the sector.
-    for sector in ("Ind", "Res", "Comm", "Tran"):
-        if low_cm_seen[sector]:
-            gen_cm = GENERIC_LOW_BY_SECTOR.get(sector, {}).get("CM")
-            if gen_cm and gen_cm in csv_ids:
-                desired.add(gen_cm)
-        if low_gnz_seen[sector]:
-            gen_nz = GENERIC_LOW_BY_SECTOR.get(sector, {}).get("GNZ")
-            if gen_nz and gen_nz in csv_ids:
-                desired.add(gen_nz)
+    # generic low-levels if any LOW was seen for that sector
+    for sec in LOW_PREFIXES:
+        if low_cm_seen[sec]:
+            cm = GENERIC_LOW_BY_SECTOR[sec]["CM"]
+            if cm in csv_ids: desired.add(cm)
+        if low_gnz_seen[sec]:
+            nz = GENERIC_LOW_BY_SECTOR[sec]["GNZ"]
+            if nz in csv_ids: desired.add(nz)
 
-    # DEM (power-system demand expansions)
-    # RE-ADDED: This logic is conditional on power_system_model
+    # DEM (power-system demand) only in PSM mode
     if is_psm:
         for r in selected_regions:
-            desired |= csv_match_prefix_region(csv_ids, "ELCHRDEM", r)
+            desired |= match_prefix_region(csv_ids, "ELCHRDEM", r)
 
-    # ---------------- Interties (alias-aware & canonicalized) ----------------
+    # interties (directional)
     intertie_pairs = [
         ("AB", "BC"), ("AB", "SK"), ("SK", "MB"),
         ("MB", "ON"), ("ON", "QC"),
@@ -636,60 +849,51 @@ def build_desired_ids_from_matrix(
         ("BC", "USA"), ("AB", "USA"), ("SK", "USA"),
         ("MB", "USA"), ("ON", "USA"), ("QC", "USA"), ("NB", "USA"),
     ]
-
-    # Build an alias-aware token set for selected regions
-    selected_tokens: Set[str] = set()
-    for r in selected_regions:
-        selected_tokens.update(region_tokens(r))  # e.g., NLLAB -> {NLLAB, NL, LAB}
+    def sel(code: str) -> bool:
+        toks = region_alias_tokens(code)
+        # selected if any alias token appears in a selected region’s aliases
+        return any(t in {a for r in selected_regions for a in region_alias_tokens(r)} for t in toks)
 
     for a, b in intertie_pairs:
-        # alias-aware membership
-        sel_a = any(tok in selected_tokens for tok in region_tokens(a))
-        sel_b = any(tok in selected_tokens for tok in region_tokens(b))
-
+        sel_a, sel_b = sel(a), sel(b)
         if sel_a and sel_b:
-            # Both sides selected -> endogenous intertie(s)
-            desired |= csv_match_intertie_any(csv_ids, ("ELCHREINT", "EINT"), a, b)
+            desired |= csv_match_intertie_dir_any(csv_ids, ("ELCHREINT", "EINT"), a, b)
+            desired |= csv_match_intertie_dir_any(csv_ids, ("ELCHREINT", "EINT"), b, a)
         elif sel_a ^ sel_b:
-            # Exactly one side selected -> boundary intertie(s)
-            desired |= csv_match_intertie_any(csv_ids, ("ELCHRBINT", "BINT"), a, b)
+            if sel_a:
+                desired |= csv_match_intertie_dir_any(csv_ids, ("ELCHRBINT", "BINT"), a, b)
+            else:
+                desired |= csv_match_intertie_dir_any(csv_ids, ("ELCHRBINT", "BINT"), b, a)
 
-    # AGRI/DIST rules
-    # RE-ADDED: This logic is now conditional on power_system_model
+    # AGRI/FUEL (skip AGRI when in power system mode)
     if not is_psm:
-        if "AGRIHR001" in csv_ids:
-            desired.add("AGRIHR001")
+        desired |= {x for x in csv_ids if x == "AGRIHR001"}
         for r in selected_regions:
-            desired |= csv_match_prefix_region(csv_ids, "AGRIHR", r)
-
-    if selected_regions:
-        for r in selected_regions:
-            desired |= csv_match_prefix_region(csv_ids, "FUELHR", r)
+            desired |= match_prefix_region(csv_ids, "AGRIHR", r)
+    for r in selected_regions:
+        desired |= match_prefix_region(csv_ids, "FUELHR", r)
     if "FUELHR001" in csv_ids:
         desired.add("FUELHR001")
 
-    # Generic sector HR IDs (only when that sector appears anywhere in the matrix)
-    def _maybe_add_generic(sec_key: str) -> None:
-        gen = GENERIC_BY_SECTOR.get(sec_key)
-        if gen and gen in csv_ids:
-            desired.add(gen)
+    # generics by sector (Elc generic only when relevant)
+    GENERIC_BY_SECTOR = {"Elc":"ELCHR001", "Ind":"GENINDHR001", "Res":"RESHR001", "Comm":"COMHR001", "Tran":"TRPHR001"}
+    def maybe_add_generic(sec: str):
+        g = GENERIC_BY_SECTOR.get(sec)
+        if g and g in csv_ids: desired.add(g)
 
-    # RE-ADDED: Conditional Elc generic
     if is_psm:
-        _maybe_add_generic("Elc")
+        maybe_add_generic("Elc")
     else:
-        if any((matrix.get((r, "Elc")) and matrix[(r, "Elc")].value != "NA") for r in current_regions):
-            _maybe_add_generic("Elc")
+        if any((matrix.get((r, "Elc")) and str(matrix[(r,"Elc")].value).upper() != "NA") for r in current_regions):
+            maybe_add_generic("Elc")
+    for sec in ("Ind","Res","Comm","Tran"):
+        if any((matrix.get((r, sec)) and str(matrix[(r,sec)].value).upper() != "NA") for r in current_regions):
+            maybe_add_generic(sec)
 
-    for _sec in ("Ind", "Res", "Comm", "Tran"):
-        if any((matrix.get((r, _sec)) and matrix[(r, _sec)].value != "NA") for r in current_regions):
-            _maybe_add_generic(_sec)
-
-    # RE-ADDED: Final guard for AGRIHR*
     if is_psm:
         desired = {x for x in desired if not x.startswith("AGRIHR")}
-
     return desired
+
 
 
 # ------------------------------
@@ -858,172 +1062,126 @@ def delete_rows_not_in_regions(
 
 def aggregate_sqlite_files(
     matrix: Dict[Tuple[str, str], ft.Dropdown],
-    csv_ids: Set[str],  # kept in signature for compatibility; we will ignore it
+    csv_ids: Set[str],  # ignored; we gather ids from DB
     global_settings: Dict[str, Any],
     get_current_regions,
     output_filename: str,
     input_filename: str,
 ) -> None:
     try:
-        # (A) Build from what's ACTUALLY in the input DB
+        # 1) discover ids that actually exist
         available_ids = collect_db_data_ids(input_filename)
         if not available_ids:
             raise RuntimeError("No data_id values found in the input database.")
 
-        # Use DB ids as the universe for matching
+        # 2) choose desired ids from the UI (directional interties), then restrict to available
         desired_ids = build_desired_ids_from_matrix(
             matrix=matrix,
-            csv_ids=available_ids,  # reusing parameter name; we pass DB ids
+            csv_ids=available_ids,
             global_settings=global_settings,
             get_current_regions=get_current_regions,
-        )
-        if not desired_ids:
-            logger.info("No matching IDs found; skipping aggregation")
-            return
-
-        # Only keep ids that do exist in the DB (should already be true)
+        ) or set()
         selected_data_ids = sorted(desired_ids & available_ids)
-        id_str = "('" + "', '".join(selected_data_ids) + "')"
-        logger.debug("Selected IDs (pinned) count: %d", len(selected_data_ids))
 
-        master_db_path = input_filename
-        output_db = output_filename
+        # 3) create schema and copy tables (data_id-filtered where present)
+        if os.path.exists(output_filename):
+            os.remove(output_filename)
+        out_conn = sqlite3.connect(output_filename)
+        out_cur  = out_conn.cursor()
+        with open(SCHEMA_FILE, "r", encoding="utf-8") as fh:
+            out_cur.executescript(fh.read())
+        out_conn.commit()
 
-        if os.path.exists(output_db):
-            os.remove(output_db)
-            logger.debug("Removed existing output DB: %s", output_db)
-
-        # Create output schema
-        output_conn = sqlite3.connect(output_db)
-        output_cursor = output_conn.cursor()
-        with open(SCHEMA_FILE, 'r') as file:
-            schema = file.read()
-        output_cursor.executescript(schema)
-        output_conn.commit()
-
-        # Read from master
-        master_conn = sqlite3.connect(master_db_path)
-        master_cursor = master_conn.cursor()
-
-        master_cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = {t[0] for t in master_cursor.fetchall()}
-
-        # index-only tables handled by schema or labels
+        in_conn = sqlite3.connect(input_filename)
+        in_cur  = in_conn.cursor()
+        in_cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = {t[0] for t in in_cur.fetchall()}
         tables -= {
-            'CommodityType', 'Operator', 'TechnologyType', 'TimePeriodType',
-            'DataQualityCredibility', 'DataQualityDataQualityGeography',
-            'DataQualityStructure', 'DataQualityTechnology', 'DataQualityTime',
-            'TechnologyLabel', 'CommodityLabel', 'DataSourceLabel'
+            'CommodityType','Operator','TechnologyType','TimePeriodType',
+            'DataQualityCredibility','DataQualityDataQualityGeography',
+            'DataQualityStructure','DataQualityTechnology','DataQualityTime',
+            'TechnologyLabel','CommodityLabel','DataSourceLabel'
         }
+        out_cur.execute("PRAGMA foreign_keys = OFF;")
+        id_sql = "('" + "', '".join(selected_data_ids) + "')" if selected_data_ids else None
+        for t in tables:
+            cols = [c[1] for c in in_cur.execute(f"PRAGMA table_info({t});")]
+            if 'data_id' in cols and id_sql:
+                in_cur.execute(f"SELECT * FROM {t} WHERE data_id IN {id_sql};")
+            else:
+                in_cur.execute(f"SELECT * FROM {t};")
+            rows = in_cur.fetchall()
+            if rows:
+                placeholders = ", ".join(["?"] * len(in_cur.description))
+                out_cur.executemany(f"INSERT OR IGNORE INTO {t} VALUES ({placeholders});", rows)
+            out_conn.commit()
 
-        # Copy (filter by data_id when present)
-        output_cursor.execute('PRAGMA foreign_keys = OFF;')
-        for table in tables:
-            try:
-                cols = [c[1] for c in master_cursor.execute(f'PRAGMA table_info({table});')]
-                if 'data_id' in cols:
-                    master_cursor.execute(f"SELECT * FROM {table} WHERE data_id IN {id_str};")
-                else:
-                    master_cursor.execute(f"SELECT * FROM {table};")
-                data = master_cursor.fetchall()
-                if data:
-                    columns = [col[0] for col in master_cursor.description]
-                    placeholders = ', '.join(['?'] * len(columns))
-                    output_cursor.executemany(f"INSERT OR IGNORE INTO {table} VALUES ({placeholders});", data)
-                    logger.debug("Copied table: %s (%s rows)", table, len(data))
-                output_conn.commit()
-            except sqlite3.Error as e:
-                logger.exception("SQLite error copying table %s: %s", table, e)
-                continue
+        # 4) prune wrong-direction interties BEFORE anything else
+        try:
+            selected_regions = list(get_current_regions()) if callable(get_current_regions) else []
+        except Exception:
+            selected_regions = []
+        prune_unrequested_interties(out_conn, selected_regions)
 
-        # (B) Create PIN tables to protect selected rows through ALL pruning
-        output_cursor.executescript("""
+        # 4.5) NEW: data_id-aware region prune for tables without a 'region' column
+        prune_unselected_data_ids(out_conn, selected_regions)
+
+        # 5) REGION PRUNE *BEFORE* pinning and demand-pruning
+        delete_rows_not_in_regions(out_conn, list(tables), selected_regions)
+        out_conn.commit()
+
+
+        # 6) create pins AFTER region prune
+        out_cur.executescript("""
         CREATE TABLE IF NOT EXISTS PinnedDataIDs(data_id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS PinnedTechs(tech TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS PinnedComms(name TEXT PRIMARY KEY);
         """)
-        output_cursor.executemany(
-            "INSERT OR IGNORE INTO PinnedDataIDs(data_id) VALUES (?)",
-            [(i,) for i in selected_data_ids]
-        )
-        # Pinned techs derived from Technology rows carrying pinned data_id
-        output_cursor.execute("""
+        if selected_data_ids:
+            out_cur.executemany("INSERT OR IGNORE INTO PinnedDataIDs(data_id) VALUES (?)", [(i,) for i in selected_data_ids])
+        out_cur.execute("""
             INSERT OR IGNORE INTO PinnedTechs(tech)
             SELECT DISTINCT tech FROM Technology WHERE data_id IN (SELECT data_id FROM PinnedDataIDs)
         """)
-        # Pinned commodities connected to pinned techs
-        output_cursor.execute("""
+        out_cur.execute("""
             INSERT OR IGNORE INTO PinnedComms(name)
-            SELECT DISTINCT input_comm FROM Efficiency WHERE tech IN (SELECT tech FROM PinnedTechs)
+            SELECT DISTINCT input_comm  FROM Efficiency WHERE tech IN (SELECT tech FROM PinnedTechs)
             UNION
             SELECT DISTINCT output_comm FROM Efficiency WHERE tech IN (SELECT tech FROM PinnedTechs)
             UNION
-            SELECT DISTINCT emis_comm FROM EmissionActivity WHERE tech IN (SELECT tech FROM PinnedTechs)
+            SELECT DISTINCT emis_comm   FROM EmissionActivity WHERE tech IN (SELECT tech FROM PinnedTechs)
         """)
-        output_conn.commit()
-        selected_regions = sorted(infer_selected_regions_from_matrix(matrix))
-        prune_unrequested_interties(output_conn, selected_regions)
-        # (C) Demand-led pruning (but never remove pinned ids/techs/comms)
-        com_list, tech_list = get_demand_lists_region_aware(
-            output_db, output_conn, power_system_model=global_settings.get("power_system_model", False)
-        )
+        out_conn.commit()
 
+        # 7) demand-led pruning (now working on AB/BC-scoped rows only; respect pins)
+        com_list, tech_list = get_demand_lists_region_aware(
+            output_filename, out_conn, power_system_model=global_settings.get("power_system_model", False)
+        )
         if tech_list:
             tech_str = "('" + "', '".join(tech_list) + "')"
-            output_cursor.execute(f'''
-                DELETE FROM Efficiency 
-                WHERE tech NOT IN {tech_str}
-                  AND tech NOT IN (SELECT tech FROM PinnedTechs)
-            ''')
-            output_cursor.execute(f'''
-                DELETE FROM Technology 
-                WHERE tech NOT IN {tech_str}
-                  AND tech NOT IN (SELECT tech FROM PinnedTechs)
-            ''')
-            output_cursor.execute(f'''
-                DELETE FROM LifetimeTech 
-                WHERE tech NOT IN {tech_str}
-                  AND tech NOT IN (SELECT tech FROM PinnedTechs)
-            ''')
-            output_cursor.execute(f'''
-                DELETE FROM CostVariable 
-                WHERE tech NOT IN {tech_str}
-                  AND tech NOT IN (SELECT tech FROM PinnedTechs)
-            ''')
-            output_cursor.execute(f'''
-                DELETE FROM EmissionActivity 
-                WHERE tech NOT IN {tech_str}
-                  AND tech NOT IN (SELECT tech FROM PinnedTechs)
-            ''')
-
+            for tbl in ("Efficiency","Technology","LifetimeTech","CostVariable","EmissionActivity"):
+                out_cur.execute(
+                    f"DELETE FROM {tbl} WHERE tech NOT IN {tech_str} AND tech NOT IN (SELECT tech FROM PinnedTechs)"
+                )
         if com_list:
             com_str = "('" + "', '".join(com_list) + "')"
-            output_cursor.execute(f'''
-                DELETE FROM Commodity 
-                WHERE name NOT IN {com_str}
-                  AND name NOT IN (SELECT name FROM PinnedComms)
-            ''')
+            out_cur.execute(
+                f"DELETE FROM Commodity WHERE name NOT IN {com_str} AND name NOT IN (SELECT name FROM PinnedComms)"
+            )
+        out_conn.commit()
 
-        output_conn.commit()
+        # 8) final cleanup honoring pinned techs
+        out_cur.execute("SELECT tech FROM PinnedTechs")
+        pinned_techs = {r[0] for r in out_cur.fetchall()}
+        in_conn.close(); out_conn.close()
+        filter_func(output_filename, pinned_techs)
 
-        # (D) Region pruning (alias-aware, with pin guards)
-        selected_regions = sorted(infer_selected_regions_from_matrix(matrix))
-        logger.debug("Selected regions for pruning: %s", selected_regions if selected_regions else "(none)")
-        delete_rows_not_in_regions(output_conn, list(tables), selected_regions)
-
-        # Capture pinned techs for the final pass
-        output_cursor.execute("SELECT tech FROM PinnedTechs")
-        pinned_techs = {r[0] for r in output_cursor.fetchall()}
-
-        master_conn.close()
-        output_conn.close()
-
-        # (E) Final post-aggregation cleanup — respect pinned techs
-        filter_func(output_db, pinned_techs)
-        logger.info("Aggregation complete. Output: %s", output_db)
+        logger.info("Aggregation complete. Output: %s", output_filename)
     except Exception as e:
         logger.exception("Unhandled error during aggregation (input=%s output=%s): %s", input_filename, output_filename, e)
         raise
+
+
 
 
 
@@ -1095,9 +1253,7 @@ def main(page: ft.Page) -> None:
             logger.exception("Failed to save config %s: %s", CONFIG_FILE, e)
             pass
 
-    def get_current_regions() -> List[str]:
-        # Regions always include all
-        return ALL_REGIONS
+
 
     # --- UI builders / updaters ---
 
@@ -1266,9 +1422,17 @@ def main(page: ft.Page) -> None:
             page.update()
         except Exception:
             pass
+    # Use the actual UI selections (rows with any non-NA cell)
+    def selected_regions_for_run() -> List[str]:
+        try:
+            return sorted(list(infer_selected_regions_from_matrix(matrix)))
+        except Exception:
+            return []
 
     # --- Settings events ---
-
+    def get_current_regions() -> List[str]:
+        # Regions always include all
+        return ALL_REGIONS
     def on_scenario_change(e: ft.ControlEvent) -> None:
         """Handle change for the scenario dropdown."""
         global_settings["scenario"] = str(e.control.value)
@@ -1313,9 +1477,9 @@ def main(page: ft.Page) -> None:
             # NOTE: csv_ids parameter is ignored now; keep an empty set for signature compatibility
             aggregate_sqlite_files(
                 matrix=matrix,
-                csv_ids=set(),
+                csv_ids=set(),  # ignored by the implementation
                 global_settings=global_settings,
-                get_current_regions=get_current_regions,
+                get_current_regions=selected_regions_for_run,  # <-- use the UI-derived regions
                 input_filename=input_filename,
                 output_filename=output_filename,
             )
