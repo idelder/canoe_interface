@@ -469,6 +469,7 @@ def main(page: ft.Page) -> None:
 
             # Update matrix values
             key = f"{region}|{sector}"
+            val = Level.EXCLUDED.value
             if saved_cfg and saved_cfg.get("matrix") and key in saved_cfg["matrix"]:
                 try:
                     val = saved_cfg["matrix"].get(key)
