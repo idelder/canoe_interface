@@ -85,9 +85,11 @@ def get_matrix_selection(
     global_settings: Dict[str, Any],
 ) -> Set[Sector, Variant, Feature, Region, Region]:
     """
-    Use only ids that actually exist in the current DB.
-    Interties are *directional*: endogenous keeps both ways iff both regions selected;
-    boundary keeps only origin->dest when origin is selected.
+    1. Get the active region-sector combos and their generic (non-regional) variant
+    2. If only electricity in a region, add grid demand
+    3. Add endogenous and boundary interties based on selected regions
+    4. Add fuels for all active regions
+    5. Add agriculture for active regions where anything but electricity is present
     """
 
     # Get the low-res scenario
@@ -95,8 +97,8 @@ def get_matrix_selection(
 
     selections: Set[Sector, Variant, Feature, Region, Region] = set()
     regions: Set[Region] = set()
-    for s in TABLE_SECTORS:
-        for r in TABLE_REGIONS:
+    for r in TABLE_REGIONS:
+        for s in TABLE_SECTORS:
             if not (dd := rs_active(matrix, r, s)):
                 continue
 
@@ -126,9 +128,9 @@ def get_matrix_selection(
             ))
 
             # Special case: if only Elc is active for a region, add electricity demand
-            if s == Sector.ELECTRICITY.value and not any(
+            if s == Sector.ELECTRICITY.value and not any((
                 rs_active(matrix, r, _s) for _s in TABLE_SECTORS if _s != s
-            ):
+            )):
                 selections.add((
                     Sector.ELECTRICITY,
                     v,
@@ -136,6 +138,28 @@ def get_matrix_selection(
                     Region(r),
                     Region.NONE,
                 ))
+
+        # Add agriculture if any sector other than electricity active in this region
+        if any((
+            rs_active(matrix, r, _s)
+            for _s in TABLE_SECTORS if _s != Sector.ELECTRICITY.value
+        )):
+            # Generic non-regional components
+            selections.add((
+                Sector.AGRICULTURE,
+                Variant.HIGH_RESOLUTION,
+                Feature.NONE,
+                Region.NONE,
+                Region.NONE
+            ))
+            # Regional components
+            selections.add((
+                Sector.AGRICULTURE,
+                Variant.HIGH_RESOLUTION,
+                Feature.NONE,
+                Region(r),
+                Region.NONE
+            ))
                 
     # Endogenous intertie only if both regions selected
     region_combos = {
@@ -167,6 +191,24 @@ def get_matrix_selection(
                 r1,
                 r2,
             ))
+
+    # Fuels generic non-regional components always
+    selections.add((
+            Sector.FUEL,
+            Variant.HIGH_RESOLUTION,
+            Feature.NONE,
+            Region.NONE,
+            Region.NONE
+    ))
+    # Fuels for all active regions
+    for r in regions:
+        selections.add((
+            Sector.FUEL,
+            Variant.HIGH_RESOLUTION,
+            Feature.NONE,
+            r,
+            Region.NONE
+        ))
                 
     logger.debug('Selections for aggregation:')
     desired_ids: Set[str] = set()
