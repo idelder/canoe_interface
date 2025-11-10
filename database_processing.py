@@ -4,7 +4,7 @@ By David Turnbull
 """
 
 import sqlite3
-from typing import Dict, Set, Tuple
+from typing import Dict, Set, Tuple, Any
 from log_setup import setup_logging
 import os
 import pandas as pd
@@ -41,7 +41,6 @@ def collect_db_data_ids(db_path: str) -> Set[str]:
     """
     ids: Set[str] = set()
     try:
-        print(db_path)
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute("SELECT data_id FROM DataSet")
@@ -137,6 +136,7 @@ def initialize_output_database(output_filename: str) -> Tuple[sqlite3.Connection
 def aggregate_sqlite_files(
     input_filename: str,
     output_filename: str,
+    global_settings: Dict[str, Any],
     desired_ids: Set[str],
 ) -> None:
     """
@@ -146,6 +146,10 @@ def aggregate_sqlite_files(
       3) Copy tables (filter by data_id where present)
       4) Final cleanup post_process
     """
+
+    conn = None
+    curs = None
+
     try:
         cmd: str = None # initialise for error logging if needed
 
@@ -165,9 +169,17 @@ def aggregate_sqlite_files(
         
         logger.debug("Executing SQLite transfers:")
         for t in tables:
+
+            if not global_settings.get("is_processing", True):
+                return
+            
             cols = [c[1] for c in curs.execute(f"PRAGMA dataset.table_info({t});")]
             if 'data_id' in cols:
                 for data_id in data_ids:
+
+                    if not global_settings.get("is_processing", True):
+                        return
+
                     cmd = f"INSERT OR IGNORE INTO {t} SELECT * FROM dataset.{t} WHERE data_id == '{data_id}';"
                     curs.execute(cmd)
                     conn.commit()
@@ -177,10 +189,11 @@ def aggregate_sqlite_files(
                 conn.commit()
 
         conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute('DETACH dataset')
         conn.close()
 
         # 4) Final cleanup
-        post_process(output_filename)
+        post_process(output_filename = output_filename, global_settings = global_settings)
 
         logger.info("Aggregation complete. Output: %s", output_filename)
 
@@ -190,17 +203,26 @@ def aggregate_sqlite_files(
             logger.debug("Last SQLite command: %s", cmd)
         raise RuntimeError(f"Unhandled error during aggregation: {e}")
     
+    finally:
+        if conn:
+            conn.execute('DETACH dataset')
+            conn.close()
+    
 #########################################
 # Post-Aggregation Filter / Cleanup
 #########################################
 
-def post_process(output_filename: str) -> None:
+def post_process(
+        output_filename: str,
+        global_settings: Dict[str, Any]
+    ) -> None:
     """
     Removes supply-side orphans (region-tech combos that lead nowhere because
     of excluded regions/sectors/resolutions or lifetime pruning).
     """
 
     MAX_ITERS = 20
+    conn = None
 
     try:
         conn = sqlite3.connect(output_filename)
@@ -210,6 +232,9 @@ def post_process(output_filename: str) -> None:
 
         # ---- Pass 1: Remove supply orphans by region (lifetime naive) ----
         for iter in range(MAX_ITERS):
+
+            if not global_settings.get("is_processing", True):
+                return
 
             bad_rt = curs.execute(
                 """
@@ -233,10 +258,14 @@ def post_process(output_filename: str) -> None:
 
             deleted_total = 0
             tables = [t[0] for t in curs.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()]
-            for table in tables:
+            for table in tables:              
                 cols = [c[1] for c in curs.execute(f'PRAGMA table_info({table});')]
                 if 'region' in cols and 'tech' in cols:
                     for region, tech in bad_rt:
+
+                        if not global_settings.get("is_processing", True):
+                            return
+            
                         try:
                             curs.execute(f"DELETE FROM {table} WHERE region = ? AND tech = ?", (region, tech))
                             if curs.rowcount and curs.rowcount > 0:
@@ -256,6 +285,10 @@ def post_process(output_filename: str) -> None:
                     cols = [c[1] for c in curs.execute(f'PRAGMA table_info({table});')]
                     if 'tech' in cols:
                         for tech in tech_gone:
+
+                            if not global_settings.get("is_processing", True):
+                                return
+            
                             try:
                                 curs.execute(f"DELETE FROM {table} WHERE tech = ?", (tech,))
                                 if curs.rowcount and curs.rowcount > 0:
@@ -273,6 +306,9 @@ def post_process(output_filename: str) -> None:
 
         # ---- Pass 2: Remove supply orphans due to lifetime pruning ----
         for iter in range(MAX_ITERS):
+
+            if not global_settings.get("is_processing", True):
+                return
 
             time_all = [int(p[0]) for p in curs.execute('SELECT period FROM TimePeriod').fetchall()]
 
@@ -314,6 +350,10 @@ def post_process(output_filename: str) -> None:
 
             deleted_total = 0
             for region, input_comm, tech, vintage, output_comm in ritvo_remove:
+
+                if not global_settings.get("is_processing", True):
+                    return
+            
                 curs.execute(
                     """
                     DELETE FROM Efficiency
@@ -324,6 +364,10 @@ def post_process(output_filename: str) -> None:
                 )
                 if curs.rowcount and curs.rowcount > 0: deleted_total += curs.rowcount
                 for tbl in ("CostVariable", "CostFixed", "EmissionActivity"):
+
+                    if not global_settings.get("is_processing", True):
+                        return
+            
                     curs.execute(
                         f"DELETE FROM {tbl} WHERE region = ? AND tech = ? AND CAST(vintage AS INTEGER) = ?",
                         (region, tech, int(vintage))
@@ -337,6 +381,9 @@ def post_process(output_filename: str) -> None:
                     iter
                 )
                 break
+
+        if not global_settings.get("is_processing", True):
+            return
 
         # Delete any unused commodities (techs already cleaned up)
         curs.execute(
@@ -355,3 +402,7 @@ def post_process(output_filename: str) -> None:
     except Exception as e:
         logger.exception("post processing failed for %s: %s", output_filename, e)
         raise RuntimeError(f"post processing failed for {output_filename}: {e}")
+    
+    finally:
+        if conn:
+            conn.close()

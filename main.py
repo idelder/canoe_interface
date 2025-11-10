@@ -6,9 +6,11 @@ By David Turnbull
 
 from __future__ import annotations
 
+import subprocess
 import json
 import os
 import sys
+import atexit
 from typing import Any, Dict, Set, Tuple
 import flet as ft
 from time import sleep
@@ -255,15 +257,32 @@ def main(page: ft.Page) -> None:
         page.window.icon = icon_path
     page.window_width = 1200
     page.window_height = 700
-    
+
     # UI storage
     matrix: Dict[Tuple[str, str], ft.Dropdown] = {}
 
     # Global flags
     global_settings = {
-        "low_scenario": DEFAULT_LOW,    # Default scenario
-        "power_system_model": False # Default PSM
+        "low_scenario": DEFAULT_LOW,
+        "power_system_model": False,
+        "is_processing": False
     }
+
+    # Stop everything if window closed
+    def on_window_event(e: ft.WindowEvent):
+        if (
+            getattr(e, "type", None) == "close_request"
+            or getattr(e, "data", None) in ("close", "close_request")
+        ):  
+            status_text.value = "Exiting..."
+            page.update()
+            sleep(0.05)
+            global_settings['is_processing'] = False
+            logger.info("Processing cancelled due to window close")
+            page.window.destroy()
+
+    page.window.prevent_close = True
+    page.window.on_event = on_window_event
 
     # Widgets
     status_text = ft.Text("")
@@ -444,6 +463,18 @@ def main(page: ft.Page) -> None:
     out_filename_text_field.on_change = lambda e: save_config
 
     def on_submit(e: ft.ControlEvent) -> None:
+
+        if global_settings["is_processing"]:
+            # Cancel button action
+            global_settings["is_processing"] = False
+            logger.info("Processing cancelled by user")
+            submit_button.text = "Submit"
+            status_text.value = "Processing cancelled."
+            page.update()
+            return
+        
+        global_settings["is_processing"] = True
+        submit_button.text = "Cancel"
         status_text.value = "Processing..."
         page.update()
 
@@ -467,13 +498,20 @@ def main(page: ft.Page) -> None:
             dbp.aggregate_sqlite_files(
                 input_filename = input_filename,
                 output_filename = output_filename,
+                global_settings = global_settings,
                 desired_ids = desired_ids,
             )
-            status_text.value = f"Aggregation complete. Output: {output_filename}"
-            logger.info("Aggregation finished successfully (input=%s output=%s)", input_filename, output_filename)
+            if global_settings.get("is_processing", True):
+                status_text.value = f"Aggregation complete. Output: {output_filename}"
+                logger.info("Aggregation finished successfully (input=%s output=%s)", input_filename, output_filename)
         except Exception as ex:
             logger.exception("Aggregation failed (input=%s output=%s): %s", input_filename, output_filename, ex)
             status_text.value = f"Error processing database. Check log file."
+        finally:
+            # Reset processing state
+            global_settings["is_processing"] = False
+            submit_button.text = "Submit"
+            page.update()
             
         page.update()
 
