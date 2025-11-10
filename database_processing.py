@@ -9,7 +9,8 @@ from log_setup import setup_logging
 import os
 import pandas as pd
 
-from constants import SCHEMA_FILE, INDEX_TABLES, LTT_DEFAULT
+from constants import INDEX_TABLES, LTT_DEFAULT
+from directories import SCHEMA_FILE
 
 # Get logger for this module
 logger = setup_logging("database_processing")

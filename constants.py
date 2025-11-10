@@ -117,9 +117,6 @@ TABLE_REGIONS: List[Region] = sorted(
 #   Database processing constants
 #########################################
 
-SCHEMA_FILE: str = "input/schema.sql"
-"""File location for CANOE database schema SQL"""
-
 INDEX_TABLES: Set[str] = {
     'CommodityType','Operator','TechnologyType','TimePeriodType',
     'DataQualityCredibility','DataQualityGeography',

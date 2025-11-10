@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any, Dict, Set, Tuple
 import flet as ft
 from time import sleep
@@ -26,7 +27,7 @@ from constants import (
     TABLE_REGIONS,
     TABLE_SECTORS,
 )
-from directories import CONFIG_FILE
+from directories import CONFIG_FILE, ASSETS_DIR
 
 # Get logger for this module
 logger = setup_logging("main")
@@ -249,8 +250,9 @@ def main(page: ft.Page) -> None:
     page.title = "CANOE UI"
     page.vertical_alignment = ft.CrossAxisAlignment.START
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
-    icon_path = os.path.abspath("assets/icon.ico")
-    page.window.icon = icon_path
+    if sys.platform != "darwin":
+        icon_path = os.path.join(os.path.dirname(__file__), "assets", "icon.ico")
+        page.window.icon = icon_path
     page.window_width = 1200
     page.window_height = 700
     
@@ -282,8 +284,15 @@ def main(page: ft.Page) -> None:
     # RE-ADDED: Power System Checkbox
     power_system_checkbox = ft.Checkbox(label="Power system model", value=False)
     
-    image = ft.Container(content=ft.Image(src="./assets/logo.png", height=50, width=60), alignment=ft.alignment.top_right)
-
+    image = ft.Container(
+        content=ft.Image(
+            src=os.path.join("assets", "logo.png"),
+            height=50,
+            width=60
+        ),
+        alignment=ft.alignment.top_right
+    )
+    
     # load saved config (will be applied once UI elements are created)
     saved_cfg = load_config()
 
@@ -291,12 +300,22 @@ def main(page: ft.Page) -> None:
         """Persist current UI state to CONFIG_FILE (JSON)."""
         try:
             cfg = {
-                "input_filename": (in_filename_text_field.value or "").strip().strip("'").strip('"'),
-                "output_filename": (out_filename_text_field.value or "").strip().strip("'").strip('"'),
+                "input_filename": os.path.normpath(
+                    (in_filename_text_field.value or "").strip().strip("'").strip('"')
+                ),
+                "output_filename": os.path.normpath(
+                    (out_filename_text_field.value or "").strip().strip("'").strip('"')
+                ),
                 "low_scenario": (scenario_dropdown.value or DEFAULT_LOW),
                 "power_system_model": bool(power_system_checkbox.value), # RE-ADDED
-                "matrix": { f"{r}|{s}": (matrix[(r, s)].value if (r, s) in matrix and matrix[(r, s)] is not None else None)
-                            for (r, s) in matrix.keys() },
+                "matrix": {
+                    f"{r}|{s}": (
+                        matrix[(r, s)].value
+                        if (r, s) in matrix and matrix[(r, s)] is not None
+                        else None
+                    )
+                    for (r, s) in matrix.keys()
+                },
             }
             os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
             with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
@@ -573,7 +592,7 @@ def main(page: ft.Page) -> None:
     main_content = ft.Column(
         [
             image,
-            ft.Text("CANOE UI", size=24, weight=ft.FontWeight.BOLD),
+            ft.Text("CANOE RSS Selector", size=24, weight=ft.FontWeight.BOLD),
             ft.Text("Read accompanying document for details about choices and instructions", size=18),
             ft.Divider(),
             middle_row,  # expands
@@ -593,4 +612,4 @@ def main(page: ft.Page) -> None:
     update_ui_matrix()
 
 if __name__ == "__main__":
-    ft.app(target=main, assets_dir="./assets")
+    ft.app(target=main, assets_dir=ASSETS_DIR)
