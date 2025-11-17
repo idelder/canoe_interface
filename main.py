@@ -277,8 +277,9 @@ def main(page: ft.Page) -> None:
             status_text.value = "Exiting..."
             page.update()
             sleep(0.05)
+            if global_settings['is_processing']:
+                logger.info("Processing cancelled due to window close")
             global_settings['is_processing'] = False
-            logger.info("Processing cancelled due to window close")
             page.window.destroy()
 
     page.window.prevent_close = True

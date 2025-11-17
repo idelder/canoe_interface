@@ -201,12 +201,10 @@ def aggregate_sqlite_files(
         logger.exception("Unhandled error during aggregation (input=%s output=%s): %s", input_filename, output_filename, e)
         if cmd:
             logger.debug("Last SQLite command: %s", cmd)
-        raise RuntimeError(f"Unhandled error during aggregation: {e}")
-    
-    finally:
         if conn:
             conn.execute('DETACH dataset')
             conn.close()
+        raise RuntimeError(f"Unhandled error during aggregation: {e}")
     
 #########################################
 # Post-Aggregation Filter / Cleanup
@@ -401,8 +399,6 @@ def post_process(
 
     except Exception as e:
         logger.exception("post processing failed for %s: %s", output_filename, e)
-        raise RuntimeError(f"post processing failed for {output_filename}: {e}")
-    
-    finally:
         if conn:
             conn.close()
+        raise RuntimeError(f"post processing failed for {output_filename}: {e}")
